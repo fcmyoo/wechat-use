@@ -89,6 +89,67 @@ bridge_error_log() {
   printf '%s\n' "${configured:-/tmp/wechat-bridge.err}"
 }
 
+# Migrate only this tool's service, preserving custom arguments/environment.
+prepare_bridge_launchagent() {
+  local plist="$1" log_dir="${WECHAT_INSTALL_LOG_DIR:-$HOME/Library/Logs/wechat-use}"
+  mkdir -p "$log_dir" || return 1
+  chmod 700 "$log_dir" || return 1
+  python3 - "$plist" "$INSTALL_DIR" "$HOME" "$log_dir" <<'PYPLIST' || return 1
+import os, plistlib, sys, tempfile
+path, install_dir, home, logs = sys.argv[1:]
+try:
+    with open(path, 'rb') as f: data = plistlib.load(f)
+    args = data.get('ProgramArguments', [])
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        raise ValueError('ProgramArguments must be a string array')
+    data['Label'] = 'ai.wechat.bridge'
+    if 'Disabled' in data: data['Disabled'] = False
+    data['ProgramArguments'] = [os.path.join(install_dir, 'wechat-bridge')] + args[1:]
+    if 'Program' in data: data['Program'] = data['ProgramArguments'][0]
+    env = data.setdefault('EnvironmentVariables', {})
+    env['HOME'] = home
+    required = [install_dir, '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin']
+    env['PATH'] = ':'.join(dict.fromkeys(required + env.get('PATH', '').split(':'))).rstrip(':')
+    data['StandardOutPath'] = os.path.join(logs, 'bridge.log')
+    data['StandardErrorPath'] = os.path.join(logs, 'bridge.err')
+    fd, tmp = tempfile.mkstemp(prefix='.wechat-bridge-', dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, 'wb') as f: plistlib.dump(data, f)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+except Exception as e:
+    print('LaunchAgent 配置无法修复；原文件保留：' + type(e).__name__, file=sys.stderr)
+    sys.exit(1)
+PYPLIST
+  local log
+  for log in "$log_dir/bridge.log" "$log_dir/bridge.err"; do
+    if [[ -f "$log" ]]; then cp -p "$log" "$log.previous" || return 1; fi
+    : > "$log" || return 1
+    chmod 600 "$log" || return 1
+  done
+}
+
+bootstrap_bridge_launchagent() {
+  local plist="$1" domain="gui/$(id -u)" output status=0
+  if ! plutil -lint "$plist" >/dev/null 2>&1; then
+    err "LaunchAgent plist 无效：${plist}；原文件保留。"
+    return 1
+  fi
+  output=$(launchctl enable "$domain/ai.wechat.bridge" 2>&1) || status=$?
+  if [[ "$status" != 0 ]]; then
+    err "无法启用工具后台服务（exit=${status}）：$output"
+    return "$status"
+  fi
+  status=0
+  output=$(launchctl bootstrap "$domain" "$plist" 2>&1) || status=$?
+  if [[ "$status" != 0 ]]; then
+    err "后台服务注册失败（exit=${status}）：$output"
+    err "配置：${plist}；日志：$(bridge_error_log)。尚未进入权限验证。"
+    return "$status"
+  fi
+}
+
 dump_bridge_diag() {
   local label="${1:-bridge 未通过 /health 检查}"
   # All output goes to stderr — keep it on a single stream so the
@@ -565,6 +626,17 @@ sys.exit(0 if valid else 1)
 ' "$2" 2>/dev/null
 }
 
+installer_permission_state() {
+  printf '%s' "$1" | python3 -c '
+import json, sys
+try:
+    checks = [c for c in json.load(sys.stdin)["checks"] if c.get("name") == "daemon_accessibility"]
+    c = checks[0] if len(checks) == 1 else {}
+    print("granted" if c.get("ok") is True else "denied" if c.get("ok") is False and "FAIL ax_trusted=false" in str(c.get("detail", "")) else "unknown")
+except (ValueError, KeyError, TypeError, AttributeError): print("unknown")
+'
+}
+
 wechatd_ax_trusted() {
   local report
   report=$("$INSTALL_DIR/wechat" doctor --json 2>/dev/null) || return 1
@@ -656,11 +728,11 @@ print_install_next_steps() {
     step "打开「${PREFERRED_WECHAT_NAME}」，按提示完成登录。主微信无需退出。"
     pending=1
   fi
-  if ! installer_check_ok "$report" daemon_accessibility; then
+  if [[ "$(installer_permission_state "$report")" == denied ]] || bridge_log_says_tcc_missing; then
     step '副本登录后初始化并授权：wechat-use init --fix-tcc（会打开系统设置）'
     info "只需检查 $INSTALL_DIR/wechat-bridge 和 $INSTALL_DIR/wechatd，不要重置其他应用权限。"
     pending=1
-  elif [[ "$bridge_ok" != 1 ]]; then
+  elif [[ "$bridge_ok" != 1 || "$(installer_permission_state "$report")" == unknown ]]; then
     step '后台服务尚未就绪，请运行：wechat-use doctor'
     pending=1; doctor_shown=1
   fi
@@ -670,7 +742,7 @@ print_install_next_steps() {
   elif [[ "$(installer_json_value "$report" query_ready)" != true ]]; then
     if [[ "$doctor_shown" == 0 ]]; then step '检查读取配置：wechat-use doctor'; fi
     pending=1
-  elif [[ "$(installer_json_value "$report" send_ready)" != true ]]; then
+  elif [[ "$bridge_ok" == 1 && "$(installer_permission_state "$report")" == granted && "$(installer_json_value "$report" send_ready)" != true ]]; then
     step '登录后验证：wechat-use send "安装验证" filehelper（工具自动定位聊天）'
     pending=1
   fi
@@ -732,12 +804,45 @@ install_agent_skill() {
   fi
 }
 
-# Installation stays in the background. macOS permission grants require the
-# user's interaction, so expose the explicit recovery command without opening UI.
+open_permission_windows() {
+  /usr/bin/open -R "$INSTALL_DIR/wechatd" "$INSTALL_DIR/wechat-bridge" || true
+  /usr/bin/open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility' || true
+}
+
+# A user's curl | bash has a controlling terminal despite stdin being a pipe.
+# Open UI only after missing permission is established; headless runs stay quiet.
 remediate_tcc_grant() {
-  warn "Accessibility 权限未授权；安装已完成，发送功能需先授权。"
-  info "副本登录后运行：${INSTALL_DIR}/wechat init --fix-tcc（自动打开设置并选中文件，拖入后打开开关）"
-  info "需要授权的程序：${INSTALL_DIR}/wechatd 和 ${INSTALL_DIR}/wechat-bridge"
+  warn "已确认辅助功能权限缺失；已有安装和微信登录保留。"
+  local mode="${WECHAT_USE_PERMISSION_GUIDE:-auto}" interactive=0
+  if [[ "$mode" == yes ]] || { [[ "$mode" == auto ]] && [[ -t 1 || -t 2 ]]; }; then
+    if open_install_tty; then interactive=1; fi
+  fi
+  if [[ "$interactive" != 1 ]]; then
+    info "需要交互授权时运行：${INSTALL_DIR}/wechat init --fix-tcc（自动打开设置并选中文件）"
+    return 0
+  fi
+  info '自动进入授权引导；授权后继续检查，无需重新输入命令。'
+  "$INSTALL_DIR/wechat" init --fix-tcc <&3 >&3 2>&3 || true
+  if wait_for_bridge_health 5 && wechatd_ax_trusted; then
+    exec 3>&-
+    success '授权和后台服务检查通过。'
+    return 0
+  fi
+  # The bridge may have failed its own startup gate before init could query it.
+  # Keep the fallback independent of daemon/key initialization and reveal both files.
+  info '正在选中两个程序并打开辅助功能设置：若列表缺项，将选中文件拖入并打开开关。'
+  open_permission_windows
+  local deadline=$(( SECONDS + 120 ))
+  while (( SECONDS < deadline )); do
+    if wait_for_bridge_health 2 && wechatd_ax_trusted; then
+      exec 3>&-
+      success '已从后台服务确认授权，继续安装检查。'
+      return 0
+    fi
+    sleep 2
+  done
+  exec 3>&-
+  warn '暂未确认后台服务就绪；登录和密钥保留，以下体检会显示尚未完成的项目。'
 }
 
 if [[ "${WECHAT_USE_INSTALL_LIB_ONLY:-0}" == "1" ]]; then
@@ -1101,7 +1206,7 @@ for pat in \
         sleep 1
       done
       if kill -0 "$stopped_pid" 2>/dev/null; then
-        err "旧服务仍在退出（pid=$stopped_pid），请稍后重试安装。"
+        err "旧服务仍在退出（pid=${stopped_pid}），请稍后重试安装。"
         exit 1
       fi
     done
@@ -1170,7 +1275,8 @@ fi
 
 if [[ -f "${BRIDGE_PLIST_PATH}" ]]; then
   info "先 bootstrap ai.wechat.bridge 抢 wechatd spawn 权 (避免其它 LaunchAgent 派生污染 chain)"
-  launchctl bootstrap "gui/$(id -u)" "${BRIDGE_PLIST_PATH}" 2>/dev/null || true
+  prepare_bridge_launchagent "$BRIDGE_PLIST_PATH" || return 1
+  bootstrap_bridge_launchagent "$BRIDGE_PLIST_PATH" || return 1
   # Strong-trigger lazy-start: bridge 起来后 curl /health 让它 fork
   # wechatd。给 2s 让 wechatd 真正落地接管 sock,之后其它 plist 派生
   # 的 wechatd 才会发现 sock 被占而自杀。
@@ -1239,7 +1345,12 @@ if wait_for_bridge_health_retry; then
     echo ""
   else
     warn '后台接口可用，但未能确认 wechatd 的辅助功能授权，请继续检查。'
-    remediate_tcc_grant
+    permission_report=$("$INSTALL_DIR/wechat" doctor --json 2>/dev/null || true)
+    if [[ "$(installer_permission_state "$permission_report")" == denied ]]; then
+      remediate_tcc_grant
+    else
+      warn '未能核验 daemon 权限；先检查后台服务，不打开授权窗口。'
+    fi
   fi
 elif bridge_log_says_tcc_missing; then
   remediate_tcc_grant
@@ -1277,7 +1388,7 @@ fi
 printf '\n版本：wechat %s / wechatd %s / 工具微信 %s（%s）\n' \
   "$INSTALLED_VER" "$INSTALLED_DAEMON_VER" "${DETECTED_WECHAT_VERSION:-未检测到}" "${DETECTED_WECHAT_BUILD:-未知构建}"
 if [[ "$DETECTED_WECHAT_VERSION" != "$PREFERRED_WECHAT_VERSION" ]]; then
-  warn "独立副本版本需要检查：$PREFERRED_WECHAT_TARGET；请运行 wechat-use doctor。"
+  warn "独立副本版本需要检查：${PREFERRED_WECHAT_TARGET}；请运行 wechat-use doctor。"
 fi
 echo ""
 

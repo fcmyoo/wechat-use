@@ -5,6 +5,7 @@ trap 'rm -rf "$TEST_ROOT"' EXIT
 export WECHAT_FLOW_TEST_ROOT="$TEST_ROOT"
 export WECHAT_USE_INSTALL_LIB_ONLY=1
 export INSTALL_DIR="$TEST_ROOT/bin"
+export WECHAT_INSTALL_LOG_DIR="$TEST_ROOT/logs"
 mkdir -p "$INSTALL_DIR"
 source "$(cd "$(dirname "$0")/.." && pwd)/install.sh"
 cat > "$INSTALL_DIR/wechat" <<'MOCK'
@@ -77,7 +78,7 @@ reset_fixture
 print_install_next_steps "$GOOD_REPORT" active 1 > "$TEST_ROOT/ready"
 grep -F '已就绪' "$TEST_ROOT/ready" >/dev/null
 if grep -E 'auth activate|wechat-use init|fix-tcc|安装验证' "$TEST_ROOT/ready"; then exit 1; fi
-NEW_REPORT='{"status":"needs_init","query_ready":false,"send_ready":false,"checks":[{"name":"wechat_running","ok":false},{"name":"daemon_accessibility","ok":false},{"name":"config_present","ok":false},{"name":"key_file_present","ok":false}]}'
+NEW_REPORT='{"status":"needs_init","query_ready":false,"send_ready":false,"checks":[{"name":"wechat_running","ok":false},{"name":"daemon_accessibility","ok":false,"detail":"FAIL ax_trusted=false process_path=/fixture/wechatd"},{"name":"config_present","ok":false},{"name":"key_file_present","ok":false}]}'
 print_install_next_steps "$NEW_REPORT" missing 0 > "$TEST_ROOT/new"
 for step in 'auth activate' '按提示完成登录' 'wechat-use init --fix-tcc' 'wechat-use init'; do grep -F "$step" "$TEST_ROOT/new" >/dev/null; done
 print_install_next_steps "$GOOD_REPORT" inactive 1 > "$TEST_ROOT/expired"
@@ -158,7 +159,77 @@ open() { printf 'open\n' >> "$TEST_ROOT/actions"; }
 osascript() { printf 'osascript\n' >> "$TEST_ROOT/actions"; }
 tccutil() { printf 'tccutil\n' >> "$TEST_ROOT/actions"; }
 : > "$TEST_ROOT/actions"
-remediate_tcc_grant > "$TEST_ROOT/permission-guidance" 2>&1
+WECHAT_USE_PERMISSION_GUIDE=no remediate_tcc_grant > "$TEST_ROOT/permission-guidance" 2>&1
 [[ ! -s "$TEST_ROOT/actions" ]]
 grep -F 'init --fix-tcc' "$TEST_ROOT/permission-guidance" >/dev/null
 echo 'PASS: missing permissions report explicit recovery without GUI, resets, or automatic sends'
+
+# Unknown service state must never become a permission diagnosis or test send.
+UNKNOWN_SERVICE='{"status":"needs_init","query_ready":true,"send_ready":false,"checks":[{"name":"wechat_running","ok":true},{"name":"daemon_accessibility","ok":false,"detail":"daemon not running"},{"name":"config_present","ok":true},{"name":"key_file_present","ok":true}]}'
+bridge_log_says_tcc_missing() { return 1; }
+print_install_next_steps "$UNKNOWN_SERVICE" active 0 > "$TEST_ROOT/unavailable-service"
+if grep -E 'fix-tcc|安装验证|辅助功能授权' "$TEST_ROOT/unavailable-service"; then exit 1; fi
+grep -F '后台服务尚未就绪' "$TEST_ROOT/unavailable-service" >/dev/null
+[[ "$(installer_permission_state "$UNKNOWN_SERVICE")" == unknown ]]
+[[ "$(installer_permission_state "$NEW_REPORT")" == denied ]]
+echo 'PASS: unavailable service does not trigger permission or send instructions'
+
+# Existing configs are migrated without losing custom runtime settings.
+python3 - "$TEST_ROOT/migrate.plist" <<'PYFIXTURE'
+import plistlib,sys
+with open(sys.argv[1],'wb') as f:
+ plistlib.dump({'Label':'old-label','Disabled':True,'ProgramArguments':['/old/bin/wechat-bridge','--port','18400'],'EnvironmentVariables':{'CUSTOM_FIXTURE':'preserve','PATH':'/custom/bin'},'StandardErrorPath':'/missing/path/old.err'},f)
+PYFIXTURE
+prepare_bridge_launchagent "$TEST_ROOT/migrate.plist"
+LAUNCHAGENT_PLIST="$TEST_ROOT/migrate.plist"
+[[ "$(bridge_error_log)" == "$TEST_ROOT/logs/bridge.err" ]]
+python3 - "$TEST_ROOT/migrate.plist" "$INSTALL_DIR" <<'PYASSERT'
+import plistlib,sys
+with open(sys.argv[1],'rb') as f:d=plistlib.load(f)
+assert d['Disabled'] is False
+assert d['ProgramArguments']==[sys.argv[2]+'/wechat-bridge','--port','18400']
+assert d['EnvironmentVariables']['CUSTOM_FIXTURE']=='preserve'
+assert '/custom/bin' in d['EnvironmentVariables']['PATH'].split(':')
+assert '/usr/sbin' in d['EnvironmentVariables']['PATH'].split(':')
+PYASSERT
+printf 'invalid-plist' > "$TEST_ROOT/invalid.plist"
+if prepare_bridge_launchagent "$TEST_ROOT/invalid.plist" 2>/dev/null; then exit 1; fi
+[[ "$(cat "$TEST_ROOT/invalid.plist")" == invalid-plist ]]
+echo 'PASS: migrates binary/log/PATH settings, retains custom values and invalid original files'
+
+# Disabled service is enabled first; bootstrap errors retain the actual cause.
+(
+ launchctl() { printf '%s\n' "$*" >> "$TEST_ROOT/bootstrap-actions"; if [[ "$1" == bootstrap ]]; then echo 'Bootstrap failed: 5: Input/output error' >&2; return 5; fi; }
+ if bootstrap_bridge_launchagent "$TEST_ROOT/migrate.plist" > "$TEST_ROOT/bootstrap-output" 2>&1; then exit 1; fi
+ grep -F 'Bootstrap failed: 5: Input/output error' "$TEST_ROOT/bootstrap-output" >/dev/null
+ [[ "$(head -1 "$TEST_ROOT/bootstrap-actions")" == enable* ]]
+)
+echo 'PASS: enables owned service and preserves bootstrap failure diagnostics'
+
+# In an explicitly interactive flow the installer runs the guide itself.
+(
+ open_install_tty() { exec 3<>"$TEST_ROOT/fake-terminal"; }
+ wait_for_bridge_health() { return 0; }
+ wechatd_ax_trusted() { return 0; }
+ : > "$TEST_ROOT/actions"
+ WECHAT_USE_PERMISSION_GUIDE=yes remediate_tcc_grant >/dev/null 2>&1
+ grep -Fx 'init --fix-tcc' "$TEST_ROOT/actions" >/dev/null
+)
+echo 'PASS: interactive recovery runs the guide and verifies service without another user command'
+
+# A bridge startup TCC gate can block RPC onboarding: reveal files directly,
+# then validate the actual service instead of treating init exit 0 as readiness.
+(
+ open_install_tty() { exec 3<>"$TEST_ROOT/fake-terminal"; }
+ probes=0
+ wait_for_bridge_health() { probes=$((probes+1)); [[ "$probes" -ge 3 ]]; }
+ wechatd_ax_trusted() { return 0; }
+ sleep() { :; }
+ open_permission_windows() { printf 'reveal-for-drag\n' >> "$TEST_ROOT/actions"; }
+ : > "$TEST_ROOT/actions"
+ WECHAT_USE_PERMISSION_GUIDE=yes remediate_tcc_grant >/dev/null 2>&1
+ [[ "$probes" == 3 ]]
+ grep -Fx 'reveal-for-drag' "$TEST_ROOT/actions" >/dev/null
+ if grep -E 'send|tccutil|kickstart' "$TEST_ROOT/actions"; then exit 1; fi
+)
+echo 'PASS: bridge permission fallback reveals files and waits for actual service readiness'
