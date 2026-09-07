@@ -815,12 +815,11 @@ open_permission_windows() {
 # Persist only the service implementation, not a downloader or a second wizard.
 # init, the setup window and a later repair all call this same installed helper.
 install_setup_service() {
-  local source="$STAGE/wechat-setup-service" destination="$INSTALL_DIR/wechat-setup-service" temporary
+  local source="$STAGE/wechat-setup-service" destination="$INSTALL_DIR/wechat-setup-service"
   [[ -f "$source" && ! -L "$source" ]] || { err '安装包缺少设置服务组件。'; return 1; }
   bash -n "$source" || return 1
-  temporary=$(mktemp "$INSTALL_DIR/.wechat-setup-service.XXXXXX") || return 1
-  install -m 755 "$source" "$temporary" || { rm -f "$temporary"; return 1; }
-  if [[ -f "$destination" ]] && cmp -s "$temporary" "$destination"; then rm -f "$temporary"; else mv -f "$temporary" "$destination"; fi
+  installed_binary_matches_staged "$source" "$destination" && return 0
+  install_binary_atomically "$source" "$destination"
 }
 
 setup_app_path() { printf '%s/Applications/WechatUseSetup.app\n' "$HOME"; }
