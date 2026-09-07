@@ -259,6 +259,7 @@ PYJOB
  if request_background_permission wechatd; then exit 1; fi
  [[ -z "$PERMISSION_JOB_DOMAIN" && -z "$PERMISSION_JOB_DIR" ]]
  [[ "$(grep -c '^bootout gui/.*/ai.wechat.permission.' "$TEST_ROOT/job-actions")" == 2 ]]
+ if grep -Fx reveal "$TEST_ROOT/job-actions"; then exit 1; fi
 )
 echo 'PASS: one-shot launchd request uses installed identity and cleans up success/failure'
 
@@ -270,3 +271,20 @@ echo 'PASS: one-shot launchd request uses installed identity and cleans up succe
  if grep -E 'Fix in 30|kickstart' "$TEST_ROOT/short-permission-error"; then exit 1; fi
 )
 echo 'PASS: permission diagnostics suppress obsolete manual command instructions'
+
+# Allow an already valid grant to finish before revealing Settings/Finder.
+(
+ launchctl() {
+   case "$1" in
+     print)
+       n=$(cat "$TEST_ROOT/permission-polls"); n=$((n+1)); printf '%s' "$n" > "$TEST_ROOT/permission-polls"
+       if [[ "$n" -lt 3 ]]; then printf '\tstate = running\n'; else printf '\tstate = not running\n\tlast exit code = 0\n'; fi ;;
+   esac
+ }
+ sleep() { :; }
+ open_permission_windows() { printf 'reveal\n' >> "$TEST_ROOT/delayed-reveal"; }
+ printf 0 > "$TEST_ROOT/permission-polls"
+ request_background_permission wechat-bridge
+ [[ "$(grep -c '^reveal$' "$TEST_ROOT/delayed-reveal")" == 1 ]]
+)
+echo 'PASS: existing grants skip Finder; a pending system grant gets one reveal only'

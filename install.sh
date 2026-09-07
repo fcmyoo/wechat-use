@@ -855,6 +855,7 @@ PYPERM
 
 wait_permission_agent() {
   local deadline=$(( SECONDS + 100 )) snapshot exit_code state
+  local reveal="${1:-no}" checks=0 revealed=0
   while (( SECONDS < deadline )); do
     snapshot=$(launchctl print "$PERMISSION_JOB_DOMAIN" 2>/dev/null || true)
     exit_code=$(printf '%s\n' "$snapshot" | awk -F' = ' '/^[[:space:]]*last exit code = / {print $2;exit}')
@@ -864,6 +865,11 @@ wait_permission_agent() {
       [[ "$exit_code" == 0 ]]
       return $?
     fi
+    checks=$((checks+1))
+    if [[ "$reveal" == yes && "$revealed" == 0 && "$checks" -ge 2 ]]; then
+      open_permission_windows
+      revealed=1
+    fi
     sleep 1
   done
   cleanup_permission_agent
@@ -872,8 +878,7 @@ wait_permission_agent() {
 
 request_background_permission() {
   start_permission_agent "$1" || return 1
-  open_permission_windows
-  wait_permission_agent
+  wait_permission_agent yes
 }
 
 # A user's curl | bash has a controlling terminal despite piped stdin.
