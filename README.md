@@ -59,6 +59,10 @@ curl -fsSL https://raw.githubusercontent.com/leeguooooo/wechat-use/main/install.
 
 后续恢复也打开“应用程序”中的“微信工具设置”，无需输入诊断或修复命令。旧授权开关已开却不生效时，窗口先刷新后台检查，再提供对应工具的恢复说明。详见[设置指南](./docs/setup.html)。v1.18.5 及更早版本的终端流程见[旧版安装说明](./docs/install.md)。
 
+遇到问题时，窗口会显示问题代码，并提供“复制诊断信息”。系统及工具版本由窗口采集，不需要自己查环境或运行诊断命令。需要管理员确认时点击“授权并继续”，在 macOS 弹窗中完成即可。
+
+[设置问题处理指南](./docs/setup-support.html)
+
 ---
 
 ## 命令行用法
