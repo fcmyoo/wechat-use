@@ -114,7 +114,7 @@ if previous_clone_choice_is_valid "$TEST_ROOT/managed.json"; then exit 1; fi
 (
   previous_clone_choice_is_valid() { return 1; }
   open_install_tty() { return 1; }
-  if WECHAT_USE_PREFER_419=ask choose_preferred_wechat_419 >/dev/null 2>&1; then exit 1; fi
+  WECHAT_USE_PREFER_419=ask choose_preferred_wechat_419 >/dev/null 2>&1
 )
 echo 'PASS: confirmed matching clone reuses consent; mismatched metadata and explicit refusal stay protected'
 
@@ -161,7 +161,7 @@ tccutil() { printf 'tccutil\n' >> "$TEST_ROOT/actions"; }
 : > "$TEST_ROOT/actions"
 WECHAT_USE_PERMISSION_GUIDE=no remediate_tcc_grant > "$TEST_ROOT/permission-guidance" 2>&1
 [[ ! -s "$TEST_ROOT/actions" ]]
-grep -F 'init --fix-tcc' "$TEST_ROOT/permission-guidance" >/dev/null
+grep -F '一次系统授权' "$TEST_ROOT/permission-guidance" >/dev/null
 echo 'PASS: missing permissions report explicit recovery without GUI, resets, or automatic sends'
 
 # Unknown service state must never become a permission diagnosis or test send.
@@ -206,30 +206,85 @@ echo 'PASS: migrates binary/log/PATH settings, retains custom values and invalid
 )
 echo 'PASS: enables owned service and preserves bootstrap failure diagnostics'
 
-# In an explicitly interactive flow the installer runs the guide itself.
+# Authorization originates from launchd, then the real service is refreshed.
 (
  open_install_tty() { exec 3<>"$TEST_ROOT/fake-terminal"; }
- wait_for_bridge_health() { return 0; }
+ request_background_permission() { printf 'request %s\n' "$1" >> "$TEST_ROOT/actions"; }
+ wait_for_bridge_health_retry() { return 0; }
  wechatd_ax_trusted() { return 0; }
  : > "$TEST_ROOT/actions"
- WECHAT_USE_PERMISSION_GUIDE=yes remediate_tcc_grant >/dev/null 2>&1
- grep -Fx 'init --fix-tcc' "$TEST_ROOT/actions" >/dev/null
+ WECHAT_USE_PERMISSION_GUIDE=yes remediate_tcc_grant > "$TEST_ROOT/guide-output" 2>&1
+ grep -Fx 'request wechat-bridge' "$TEST_ROOT/actions" >/dev/null
+ [[ "$(grep -c '^reset$' "$TEST_ROOT/actions")" == 1 ]]
+ if grep -E '^init|^send|^tccutil' "$TEST_ROOT/actions"; then exit 1; fi
 )
-echo 'PASS: interactive recovery runs the guide and verifies service without another user command'
+echo 'PASS: requests bridge identity, refreshes service, never spawns init from Terminal'
 
-# A bridge startup TCC gate can block RPC onboarding: reveal files directly,
-# then validate the actual service instead of treating init exit 0 as readiness.
+# Bridge permission alone is insufficient if the actual daemon is still denied.
 (
  open_install_tty() { exec 3<>"$TEST_ROOT/fake-terminal"; }
- probes=0
- wait_for_bridge_health() { probes=$((probes+1)); [[ "$probes" -ge 3 ]]; }
- wechatd_ax_trusted() { return 0; }
- sleep() { :; }
- open_permission_windows() { printf 'reveal-for-drag\n' >> "$TEST_ROOT/actions"; }
+ request_background_permission() { printf 'request %s\n' "$1" >> "$TEST_ROOT/actions"; }
+ wait_for_bridge_health_retry() { return 0; }
+ ax_polls=0
+ wechatd_ax_trusted() { ax_polls=$((ax_polls+1)); [[ "$ax_polls" -gt 1 ]]; }
+ printf '%s' "$NEW_REPORT" > "$TEST_ROOT/doctor.json"
  : > "$TEST_ROOT/actions"
- WECHAT_USE_PERMISSION_GUIDE=yes remediate_tcc_grant >/dev/null 2>&1
- [[ "$probes" == 3 ]]
- grep -Fx 'reveal-for-drag' "$TEST_ROOT/actions" >/dev/null
- if grep -E 'send|tccutil|kickstart' "$TEST_ROOT/actions"; then exit 1; fi
+ WECHAT_USE_PERMISSION_GUIDE=yes remediate_tcc_grant > "$TEST_ROOT/two-identities-output" 2>&1
+ grep -Fx 'request wechatd' "$TEST_ROOT/actions" >/dev/null
+ [[ "$(grep -c '^reset$' "$TEST_ROOT/actions")" == 2 ]]
+ [[ "$ax_polls" == 2 ]]
 )
-echo 'PASS: bridge permission fallback reveals files and waits for actual service readiness'
+echo 'PASS: verifies both identities instead of treating one grant as completion'
+
+# Actual job creation and completion parsing, with only launchctl mocked.
+(
+ launchctl() {
+   printf '%s\n' "$*" >> "$TEST_ROOT/job-actions"
+   case "$1" in
+     bootstrap) cp "$3" "$TEST_ROOT/request-job.plist" ;;
+     print) printf '\tstate = not running\n\tlast exit code = %s\n' "$MOCK_PERMISSION_EXIT" ;;
+   esac
+ }
+ open_permission_windows() { printf 'reveal\n' >> "$TEST_ROOT/job-actions"; }
+ MOCK_PERMISSION_EXIT=0
+ request_background_permission wechat-bridge
+ [[ -z "$PERMISSION_JOB_DOMAIN" && -z "$PERMISSION_JOB_DIR" ]]
+ python3 - "$TEST_ROOT/request-job.plist" "$INSTALL_DIR" <<'PYJOB'
+import plistlib,sys
+with open(sys.argv[1],'rb') as f:d=plistlib.load(f)
+assert d['ProgramArguments']==[sys.argv[2]+'/wechat-bridge','--request-trust']
+assert d['KeepAlive'] is False and d['RunAtLoad'] is True
+PYJOB
+ MOCK_PERMISSION_EXIT=1
+ if request_background_permission wechatd; then exit 1; fi
+ [[ -z "$PERMISSION_JOB_DOMAIN" && -z "$PERMISSION_JOB_DIR" ]]
+ [[ "$(grep -c '^bootout gui/.*/ai.wechat.permission.' "$TEST_ROOT/job-actions")" == 2 ]]
+ if grep -Fx reveal "$TEST_ROOT/job-actions"; then exit 1; fi
+)
+echo 'PASS: one-shot launchd request uses installed identity and cleans up success/failure'
+
+# Do not relay the obsolete binary's terminal-command recipe to the user.
+(
+ printf 'Accessibility TCC not granted\nFix in 30 seconds: open Settings; launchctl kickstart\n' > "$TEST_ROOT/logs/bridge.err"
+ dump_bridge_diag > "$TEST_ROOT/short-permission-error" 2>&1
+ grep -F '安装器将自动引导' "$TEST_ROOT/short-permission-error" >/dev/null
+ if grep -E 'Fix in 30|kickstart' "$TEST_ROOT/short-permission-error"; then exit 1; fi
+)
+echo 'PASS: permission diagnostics suppress obsolete manual command instructions'
+
+# Allow an already valid grant to finish before revealing Settings/Finder.
+(
+ launchctl() {
+   case "$1" in
+     print)
+       n=$(cat "$TEST_ROOT/permission-polls"); n=$((n+1)); printf '%s' "$n" > "$TEST_ROOT/permission-polls"
+       if [[ "$n" -lt 3 ]]; then printf '\tstate = running\n'; else printf '\tstate = not running\n\tlast exit code = 0\n'; fi ;;
+   esac
+ }
+ sleep() { :; }
+ open_permission_windows() { printf 'reveal\n' >> "$TEST_ROOT/delayed-reveal"; }
+ printf 0 > "$TEST_ROOT/permission-polls"
+ request_background_permission wechat-bridge
+ [[ "$(grep -c '^reveal$' "$TEST_ROOT/delayed-reveal")" == 1 ]]
+)
+echo 'PASS: existing grants skip Finder; a pending system grant gets one reveal only'

@@ -58,6 +58,7 @@ wait_for_bridge_health() {
     if curl -fsS -m 1 http://127.0.0.1:18400/health >/dev/null 2>&1; then
       return 0
     fi
+    if bridge_log_says_tcc_missing; then return 1; fi
     sleep 1
   done
   return 1
@@ -71,6 +72,7 @@ wait_for_bridge_health_retry() {
   if wait_for_bridge_health 15; then
     return 0
   fi
+  if bridge_log_says_tcc_missing; then return 1; fi
   step "bridge 还没起来，再等 10s …"
   wait_for_bridge_health 10
 }
@@ -169,6 +171,10 @@ dump_bridge_diag() {
   local log
   log=$(bridge_error_log)
   if [[ -f "${log}" ]]; then
+    if tail -n 60 "$log" | grep -qE 'Accessibility TCC (not granted|missing)'; then
+      warn '后台 wechat-bridge 尚未获得辅助功能授权；安装器将自动引导，无需输入修复命令。'
+      return 0
+    fi
     printf '%s── 最近 30 行 bridge stderr (%s) ──%s\n' "${C_DIM}" "${log}" "${C_RESET}" >&2
     tail -n 30 "${log}" 2>/dev/null | sed 's/^/    /' >&2
     printf '%s── 日志结束 ──%s\n' "${C_DIM}" "${C_RESET}" >&2
@@ -384,6 +390,7 @@ previous_clone_choice_is_valid() {
 }
 
 cleanup_install_stage() {
+  cleanup_permission_agent
   if [[ -n "${WECHAT_419_MOUNT:-}" ]]; then
     hdiutil detach "$WECHAT_419_MOUNT" -quiet 2>/dev/null || true
   fi
@@ -647,7 +654,7 @@ can_reuse_running_services() {
   [[ "$(printf '%s\n' "$registered" | awk -F ' = ' '/^[[:space:]]*program = / {print $2; exit}')" == "$INSTALL_DIR/wechat-bridge" ]] || return 1
   bridge_pid=$(printf '%s\n' "$registered" | awk '/^[[:space:]]*pid = / {print $3; exit}')
   [[ "$bridge_pid" =~ ^[1-9][0-9]*$ ]] || return 1
-  health=$(curl -fsS --connect-timeout 2 --max-time 5 http://127.0.0.1:18400/health) || return 1
+  health=$(curl -fsS --connect-timeout 2 --max-time 5 http://127.0.0.1:18400/health 2>/dev/null) || return 1
   [[ "$(installer_json_value "$health" bridge_version)" == "${LATEST_TAG#v}" &&
      "$(installer_json_value "$health" daemon.version)" == "${LATEST_TAG#v}" &&
      "$(installer_json_value "$health" daemon.alive)" == true ]] || return 1
@@ -659,7 +666,7 @@ can_reuse_running_services() {
   wechatd_ax_trusted || return 1
   # A doctor probe must not have switched/restarted the daemon behind the
   # parent/path checks above (e.g. a simultaneous repair in another terminal).
-  health=$(curl -fsS --connect-timeout 2 --max-time 5 http://127.0.0.1:18400/health) || return 1
+  health=$(curl -fsS --connect-timeout 2 --max-time 5 http://127.0.0.1:18400/health 2>/dev/null) || return 1
   [[ "$(installer_json_value "$health" daemon.pid)" == "$daemon_pid" &&
      "$(installer_json_value "$health" daemon.alive)" == true ]]
 }
@@ -721,7 +728,11 @@ print_install_next_steps() {
     pending=1
   fi
   if [[ "$(installer_permission_state "$report")" == denied ]] || bridge_log_says_tcc_missing; then
-    step '副本登录后初始化并授权：wechat-use init --fix-tcc（会打开系统设置）'
+    if [[ "${PERMISSION_GUIDE_ATTEMPTED:-0}" == 1 ]]; then
+      step '系统授权尚未通过，请核对已打开的辅助功能开关；已有程序和登录保留。'
+    else
+      step '副本登录后初始化并授权：wechat-use init --fix-tcc（会打开系统设置）'
+    fi
     info "只需检查 $INSTALL_DIR/wechat-bridge 和 $INSTALL_DIR/wechatd，不要重置其他应用权限。"
     pending=1
   elif [[ "$bridge_ok" != 1 || "$(installer_permission_state "$report")" == unknown ]]; then
@@ -801,40 +812,125 @@ open_permission_windows() {
   /usr/bin/open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility' || true
 }
 
-# A user's curl | bash has a controlling terminal despite stdin being a pipe.
-# Open UI only after missing permission is established; headless runs stay quiet.
+# Permission requests must have launchd's audit context, never Terminal's.
+# The signed installed binaries implement request-trust; no new executable or
+# signing identity is created. Temporary jobs are removed on completion/Ctrl-C.
+cleanup_permission_agent() {
+  if [[ -n "${PERMISSION_JOB_DOMAIN:-}" ]]; then
+    launchctl bootout "$PERMISSION_JOB_DOMAIN" >/dev/null 2>&1 || true
+    PERMISSION_JOB_DOMAIN=""
+  fi
+  if [[ -n "${PERMISSION_JOB_DIR:-}" ]]; then
+    rm -rf -- "$PERMISSION_JOB_DIR"
+    PERMISSION_JOB_DIR=""
+  fi
+}
+
+start_permission_agent() {
+  local binary="$1" arg label output
+  case "$binary" in
+    wechat-bridge) arg=--request-trust ;;
+    wechatd) arg=request-trust ;;
+    *) return 2 ;;
+  esac
+  cleanup_permission_agent
+  PERMISSION_JOB_DIR=$(mktemp -d "${TMPDIR:-/tmp}/wechat-permission.XXXXXX") || return 1
+  label="ai.wechat.permission.${binary}.$$"
+  PERMISSION_JOB_DOMAIN="gui/$(id -u)/$label"
+  python3 - "$PERMISSION_JOB_DIR/job.plist" "$label" "$INSTALL_DIR/$binary" "$arg" "$HOME" "$PERMISSION_JOB_DIR" <<'PYPERM' || { cleanup_permission_agent; return 1; }
+import plistlib,sys
+path,label,binary,arg,home,logs=sys.argv[1:]
+with open(path,'wb') as f:
+ plistlib.dump({'Label':label,'ProgramArguments':[binary,arg],
+  'RunAtLoad':True,'KeepAlive':False,
+  'EnvironmentVariables':{'HOME':home,'PATH':'/usr/bin:/bin:/usr/sbin:/sbin'},
+  'StandardOutPath':logs+'/out.log','StandardErrorPath':logs+'/err.log'},f)
+PYPERM
+  if ! output=$(launchctl bootstrap "gui/$(id -u)" "$PERMISSION_JOB_DIR/job.plist" 2>&1); then
+    err "无法启动后台授权流程：$output"
+    cleanup_permission_agent
+    return 1
+  fi
+}
+
+wait_permission_agent() {
+  local deadline=$(( SECONDS + 100 )) snapshot exit_code state
+  local reveal="${1:-no}" checks=0 revealed=0
+  while (( SECONDS < deadline )); do
+    snapshot=$(launchctl print "$PERMISSION_JOB_DOMAIN" 2>/dev/null || true)
+    exit_code=$(printf '%s\n' "$snapshot" | awk -F' = ' '/^[[:space:]]*last exit code = / {print $2;exit}')
+    state=$(printf '%s\n' "$snapshot" | awk -F' = ' '/^[[:space:]]*state = / {print $2;exit}')
+    if [[ -n "$exit_code" && "$exit_code" != '(never exited)' && "$state" != running ]]; then
+      cleanup_permission_agent
+      [[ "$exit_code" == 0 ]]
+      return $?
+    fi
+    checks=$((checks+1))
+    if [[ "$reveal" == yes && "$revealed" == 0 && "$checks" -ge 2 ]]; then
+      open_permission_windows
+      revealed=1
+    fi
+    sleep 1
+  done
+  cleanup_permission_agent
+  return 1
+}
+
+request_background_permission() {
+  start_permission_agent "$1" || return 1
+  wait_permission_agent yes
+}
+
+# A user's curl | bash has a controlling terminal despite piped stdin.
 remediate_tcc_grant() {
-  warn "已确认辅助功能权限缺失；已有安装和微信登录保留。"
+  warn '后台服务尚未获得辅助功能授权；微信登录和密钥保留。'
   local mode="${WECHAT_USE_PERMISSION_GUIDE:-auto}" interactive=0
   if [[ "$mode" == yes ]] || { [[ "$mode" == auto ]] && [[ -t 1 || -t 2 ]]; }; then
     if open_install_tty; then interactive=1; fi
   fi
   if [[ "$interactive" != 1 ]]; then
-    info "需要交互授权时运行：${INSTALL_DIR}/wechat init --fix-tcc（自动打开设置并选中文件）"
+    info '需要本人完成一次系统授权；请由交互式安装或已连接的智能体继续授权引导。'
     return 0
   fi
-  info '自动进入授权引导；授权后继续检查，无需重新输入命令。'
-  "$INSTALL_DIR/wechat" init --fix-tcc <&3 >&3 2>&3 || true
-  if wait_for_bridge_health 5 && wechatd_ax_trusted; then
+  PERMISSION_GUIDE_ATTEMPTED=1
+  info '自动申请工具后台服务权限。已有开关先保留；列表缺项时拖入选中的程序，再打开开关。'
+  info '无需授权终端、输入命令或重新登录；完成后安装器会自动继续。'
+  if ! request_background_permission wechat-bridge; then
     exec 3>&-
-    success '授权和后台服务检查通过。'
+    warn '系统尚未确认当前后台程序的授权。旧条目开启不一定对应当前程序；请核对已选中的工具，勿全局重置权限。'
     return 0
   fi
-  # The bridge may have failed its own startup gate before init could query it.
-  # Keep the fallback independent of daemon/key initialization and reveal both files.
-  info '正在选中两个程序并打开辅助功能设置：若列表缺项，将选中文件拖入并打开开关。'
-  open_permission_windows
-  local deadline=$(( SECONDS + 120 ))
-  while (( SECONDS < deadline )); do
-    if wait_for_bridge_health 2 && wechatd_ax_trusted; then
+  # Retire the Terminal-spawned daemon left by earlier init/chat attempts.
+  # Use the existing graceful service reset; never quit/kill WeChat itself.
+  info '后台授权已确认，正在自动刷新工具服务并检查连接。'
+  if ! reset_wechat_services; then exec 3>&-; return 1; fi
+  if ! wait_for_bridge_health_retry; then
+    exec 3>&-
+    dump_bridge_diag '授权已通过，但后台连接仍不可用。'
+    return 1
+  fi
+  if ! wechatd_ax_trusted; then
+    local report
+    report=$("$INSTALL_DIR/wechat" doctor --json 2>/dev/null || true)
+    if [[ "$(installer_permission_state "$report")" != denied ]]; then
       exec 3>&-
-      success '已从后台服务确认授权，继续安装检查。'
+      warn '后台服务已启动，初始化或账号仍未就绪；保留当前授权，继续下方状态检查。'
       return 0
     fi
-    sleep 2
-  done
+    info '正在完成另一个工具进程的系统授权，完成后自动继续。'
+    if ! request_background_permission wechatd; then
+      exec 3>&-
+      warn '系统尚未确认 wechatd 的授权；已有登录和密钥保留。'
+      return 0
+    fi
+    if ! reset_wechat_services; then exec 3>&-; return 1; fi
+  fi
   exec 3>&-
-  warn '暂未确认后台服务就绪；登录和密钥保留，以下体检会显示尚未完成的项目。'
+  if wait_for_bridge_health_retry && wechatd_ax_trusted; then
+    success '工具后台服务与发送权限均已确认，安装继续。'
+  else
+    warn '后台检查尚未通过，保留现有授权；以下状态检查会显示尚未完成的项目。'
+  fi
 }
 
 if [[ "${WECHAT_USE_INSTALL_LIB_ONLY:-0}" == "1" ]]; then
@@ -855,6 +951,8 @@ choose_preferred_wechat_419 || exit $?
 mkdir -p "${INSTALL_DIR}" 2>/dev/null || true
 STAGE=$(mktemp -d)
 trap cleanup_install_stage EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Resolve the latest release tag so we can fetch a versioned tarball +
 # SHA256SUMS. Using /releases/latest/download/<file> would save one API
@@ -1299,8 +1397,9 @@ if (( ${#WECHAT_AGENT_PLISTS[@]} > 0 )); then
       success "LaunchAgent 已接管 + /health 200 OK (pid=${RUNNING_PID:-?})"
     else
       dump_bridge_diag "LaunchAgent 启动后 wechat-bridge /health 15s 内无 200 响应"
-      warn "  常见原因：Accessibility TCC 未授权 / 端口 18400 被占 / plist env 配置错"
-      warn "  下面 TCC 检查会进一步确认；如果是端口冲突跑：lsof -nP -iTCP:18400 | grep LISTEN"
+      if ! bridge_log_says_tcc_missing; then
+        warn '后台服务尚未就绪，具体原因见上方诊断；保留当前微信登录。'
+      fi
     fi
   fi
 elif [[ ! -f "$BRIDGE_PLIST_PATH" ]] && launchctl list 2>/dev/null | grep -q ai.wechat.bridge; then
