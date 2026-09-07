@@ -288,3 +288,25 @@ echo 'PASS: permission diagnostics suppress obsolete manual command instructions
  [[ "$(grep -c '^reveal$' "$TEST_ROOT/delayed-reveal")" == 1 ]]
 )
 echo 'PASS: existing grants skip Finder; a pending system grant gets one reveal only'
+
+# The native window and versioned service helper install without touching real apps.
+(
+ STAGE="$TEST_ROOT/setup-stage"
+ mkdir -p "$STAGE/WechatUseSetup.app/Contents/MacOS"
+ printf '#!/bin/bash\nexit 0\n' > "$STAGE/wechat-setup-service"
+ printf 'fixture' > "$STAGE/WechatUseSetup.app/Contents/MacOS/wechat-setup-ui"
+ printf '<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>ai.wechatskill.setup</string></dict></plist>' > "$STAGE/WechatUseSetup.app/Contents/Info.plist"
+ setup_app_path() { printf '%s/apps/WechatUseSetup.app\n' "$TEST_ROOT"; }
+ setup_state_dir() { printf '%s/state\n' "$TEST_ROOT"; }
+ codesign() { [[ "$1" != -dvv ]] || printf 'Identifier=ai.wechatskill.setup\nTeamIdentifier=6ZPXG4KVVS\n'; }
+ install_setup_window
+ [[ "$SETUP_WINDOW_AVAILABLE" == 1 ]]
+ cmp "$STAGE/wechat-setup-service" "$INSTALL_DIR/wechat-setup-service"
+ [[ -f "$TEST_ROOT/state/installation.json" ]]
+ # A repeat installation preserves matching files and remains usable.
+ install_setup_window
+ /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier unrelated.app' "$TEST_ROOT/apps/WechatUseSetup.app/Contents/Info.plist"
+ if install_setup_window 2>/dev/null; then exit 1; fi
+ [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$TEST_ROOT/apps/WechatUseSetup.app/Contents/Info.plist")" == unrelated.app ]]
+)
+echo 'PASS: setup app/helper install is repeatable and preserves an unrelated destination'
