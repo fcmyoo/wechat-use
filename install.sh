@@ -1629,6 +1629,12 @@ case ":$PATH:" in
         rc_state="unknown_shell"
         ;;
     esac
+    if [[ "${SETUP_WINDOW_AVAILABLE:-0}" == 1 ]]; then
+      case "$rc_state" in
+        appended|already_covered) success '命令路径已配置；本次设置会自动继续，无需额外输入命令。' ;;
+        *) info '设置应用已安装，本次设置会直接继续，无需先调整终端路径。' ;;
+      esac
+    else
     case "$rc_state" in
       appended)
         success "已把 ${INSTALL_DIR} 加到 ${added_file}"
@@ -1653,6 +1659,7 @@ case ":$PATH:" in
         printf '\n'
         ;;
     esac
+    fi
     ;;
 esac
 
