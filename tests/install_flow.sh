@@ -79,7 +79,7 @@ grep -F '已就绪' "$TEST_ROOT/ready" >/dev/null
 if grep -E 'auth activate|wechat-use init|fix-tcc|安装验证' "$TEST_ROOT/ready"; then exit 1; fi
 NEW_REPORT='{"status":"needs_init","query_ready":false,"send_ready":false,"checks":[{"name":"wechat_running","ok":false},{"name":"daemon_accessibility","ok":false},{"name":"config_present","ok":false},{"name":"key_file_present","ok":false}]}'
 print_install_next_steps "$NEW_REPORT" missing 0 > "$TEST_ROOT/new"
-for step in 'auth activate' '按提示完成登录' 'fix-tcc' 'wechat-use init'; do grep -F "$step" "$TEST_ROOT/new" >/dev/null; done
+for step in 'auth activate' '按提示完成登录' 'wechat-use init --fix-tcc' 'wechat-use init'; do grep -F "$step" "$TEST_ROOT/new" >/dev/null; done
 print_install_next_steps "$GOOD_REPORT" inactive 1 > "$TEST_ROOT/expired"
 grep -F 'auth renew' "$TEST_ROOT/expired" >/dev/null
 if grep -F 'auth activate' "$TEST_ROOT/expired"; then exit 1; fi
@@ -160,5 +160,5 @@ tccutil() { printf 'tccutil\n' >> "$TEST_ROOT/actions"; }
 : > "$TEST_ROOT/actions"
 remediate_tcc_grant > "$TEST_ROOT/permission-guidance" 2>&1
 [[ ! -s "$TEST_ROOT/actions" ]]
-grep -F 'doctor --fix-tcc' "$TEST_ROOT/permission-guidance" >/dev/null
+grep -F 'init --fix-tcc' "$TEST_ROOT/permission-guidance" >/dev/null
 echo 'PASS: missing permissions report explicit recovery without GUI, resets, or automatic sends'

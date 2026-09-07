@@ -237,8 +237,8 @@ maybe_smoke_send() {
   else
     warn "filehelper smoke 失败 —— 首发 warmup 未完成 / daemon 未就绪 / 运行时状态异常"
     printf '%s\n' "${output}" | sed 's/^/    /' >&2
-    warn "  解法：在 WeChat 任意聊天 GUI 里【手动】发一条消息（warmup send pipeline），"
-    warn "  然后再跑：${INSTALL_DIR}/wechat send 'hi' filehelper"
+    warn "  请运行：${INSTALL_DIR}/wechat doctor --json 查看具体原因。"
+    warn "  缺少辅助功能权限时运行 wechat-use init --fix-tcc；送达未确认时先核对历史，不要直接重发。"
   fi
 }
 
@@ -657,7 +657,7 @@ print_install_next_steps() {
     pending=1
   fi
   if ! installer_check_ok "$report" daemon_accessibility; then
-    step '辅助功能授权：wechat-use doctor --fix-tcc'
+    step '副本登录后初始化并授权：wechat-use init --fix-tcc（会打开系统设置）'
     info "只需检查 $INSTALL_DIR/wechat-bridge 和 $INSTALL_DIR/wechatd，不要重置其他应用权限。"
     pending=1
   elif [[ "$bridge_ok" != 1 ]]; then
@@ -671,7 +671,7 @@ print_install_next_steps() {
     if [[ "$doctor_shown" == 0 ]]; then step '检查读取配置：wechat-use doctor'; fi
     pending=1
   elif [[ "$(installer_json_value "$report" send_ready)" != true ]]; then
-    step '登录并打开任意聊天后验证：wechat-use send "安装验证" filehelper'
+    step '登录后验证：wechat-use send "安装验证" filehelper（工具自动定位聊天）'
     pending=1
   fi
   if [[ "$pending" == 0 ]]; then step '检查剩余问题：wechat-use doctor'; fi
@@ -736,7 +736,7 @@ install_agent_skill() {
 # user's interaction, so expose the explicit recovery command without opening UI.
 remediate_tcc_grant() {
   warn "Accessibility 权限未授权；安装已完成，发送功能需先授权。"
-  info "在方便时运行：${INSTALL_DIR}/wechat doctor --fix-tcc（会打开系统设置）"
+  info "副本登录后运行：${INSTALL_DIR}/wechat init --fix-tcc（自动打开设置并选中文件，拖入后打开开关）"
   info "需要授权的程序：${INSTALL_DIR}/wechatd 和 ${INSTALL_DIR}/wechat-bridge"
 }
 
