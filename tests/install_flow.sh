@@ -299,12 +299,15 @@ echo 'PASS: existing grants skip Finder; a pending system grant gets one reveal 
  setup_app_path() { printf '%s/apps/WechatUseSetup.app\n' "$TEST_ROOT"; }
  setup_state_dir() { printf '%s/state\n' "$TEST_ROOT"; }
  codesign() { [[ "$1" != -dvv ]] || printf 'Identifier=ai.wechatskill.setup\nTeamIdentifier=6ZPXG4KVVS\n'; }
+ install_destination_command() { printf '%s\n' "$1" >> "$TEST_ROOT/setup-install-destinations"; shift; "$@"; }
  install_setup_window
  [[ "$SETUP_WINDOW_AVAILABLE" == 1 ]]
  cmp "$STAGE/wechat-setup-service" "$INSTALL_DIR/wechat-setup-service"
  [[ -f "$TEST_ROOT/state/installation.json" ]]
+ [[ "$(wc -l < "$TEST_ROOT/setup-install-destinations" | tr -d ' ')" == 3 ]]
  # A repeat installation preserves matching files and remains usable.
  install_setup_window
+ [[ "$(wc -l < "$TEST_ROOT/setup-install-destinations" | tr -d ' ')" == 3 ]]
  /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier unrelated.app' "$TEST_ROOT/apps/WechatUseSetup.app/Contents/Info.plist"
  if install_setup_window 2>/dev/null; then exit 1; fi
  [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$TEST_ROOT/apps/WechatUseSetup.app/Contents/Info.plist")" == unrelated.app ]]
