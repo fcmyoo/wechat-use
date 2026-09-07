@@ -55,7 +55,7 @@ wait_for_bridge_health() {
   local window="${1:-15}"
   local deadline=$(( SECONDS + window ))
   while (( SECONDS < deadline )); do
-    if curl -fsS -m 1 http://127.0.0.1:18400/health >/dev/null 2>&1; then
+    if curl -fsS -m 1 "http://127.0.0.1:${WECHAT_BRIDGE_PORT:-18400}${WECHAT_SETUP_HEALTH_PATH:-/health}" >/dev/null 2>&1; then
       return 0
     fi
     if bridge_log_says_tcc_missing; then return 1; fi
@@ -812,6 +812,57 @@ open_permission_windows() {
   /usr/bin/open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility' || true
 }
 
+# Persist only the service implementation, not a downloader or a second wizard.
+# init, the setup window and a later repair all call this same installed helper.
+install_setup_service() {
+  local source="$STAGE/wechat-setup-service" destination="$INSTALL_DIR/wechat-setup-service" temporary
+  [[ -f "$source" && ! -L "$source" ]] || { err '安装包缺少设置服务组件。'; return 1; }
+  bash -n "$source" || return 1
+  temporary=$(mktemp "$INSTALL_DIR/.wechat-setup-service.XXXXXX") || return 1
+  install -m 755 "$source" "$temporary" || { rm -f "$temporary"; return 1; }
+  if [[ -f "$destination" ]] && cmp -s "$temporary" "$destination"; then rm -f "$temporary"; else mv -f "$temporary" "$destination"; fi
+}
+
+setup_app_path() { printf '%s/Applications/WechatUseSetup.app\n' "$HOME"; }
+setup_state_dir() { printf '%s/.wx-rs\n' "$HOME"; }
+
+install_setup_window() {
+  local source="$STAGE/WechatUseSetup.app" target temporary identity
+  target=$(setup_app_path)
+  SETUP_WINDOW_AVAILABLE=0
+  [[ -d "$source" ]] || return 0 # Older releases keep their supported installer path.
+  codesign --verify --deep --strict "$source" || return 1
+  identity=$(codesign -dvv "$source" 2>&1) || return 1
+  printf '%s\n' "$identity" | grep -Fx 'TeamIdentifier=6ZPXG4KVVS' >/dev/null || return 1
+  printf '%s\n' "$identity" | grep -Fx 'Identifier=ai.wechatskill.setup' >/dev/null || return 1
+  mkdir -p "$(dirname "$target")"
+  if [[ -e "$target" ]]; then
+    [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$target/Contents/Info.plist" 2>/dev/null)" == ai.wechatskill.setup ]] || {
+      err '设置窗口的安装位置被其他应用占用，未替换该应用。'; return 1;
+    }
+  fi
+  if [[ ! -d "$target" ]] || ! diff -qr "$source" "$target" >/dev/null 2>&1; then
+    temporary=$(mktemp -d "$(dirname "$target")/.wechat-setup.XXXXXX") || return 1
+    /usr/bin/ditto "$source" "$temporary/WechatUseSetup.app" || { rm -rf "$temporary"; return 1; }
+    codesign --verify --deep --strict "$temporary/WechatUseSetup.app" || { rm -rf "$temporary"; return 1; }
+    if [[ -d "$target" ]]; then mv "$target" "$temporary/previous.app" || { rm -rf "$temporary"; return 1; }; fi
+    if ! mv "$temporary/WechatUseSetup.app" "$target"; then
+      [[ ! -d "$temporary/previous.app" ]] || mv "$temporary/previous.app" "$target"
+      rm -rf "$temporary"; return 1
+    fi
+    rm -rf "$temporary"
+  fi
+  install_setup_service || return 1
+  python3 - "$INSTALL_DIR/wechat" "$target" "${LATEST_TAG#v}" "$(setup_state_dir)" <<'PYSETUP'
+import json,os,pathlib,sys,tempfile
+root=pathlib.Path(sys.argv[4]);root.mkdir(parents=True,exist_ok=True)
+fd,tmp=tempfile.mkstemp(prefix='.installation-',dir=str(root))
+with os.fdopen(fd,'w') as f:json.dump({'cli_path':sys.argv[1],'setup_app':sys.argv[2],'version':sys.argv[3]},f)
+os.replace(tmp,root/'installation.json')
+PYSETUP
+  SETUP_WINDOW_AVAILABLE=1
+}
+
 # Permission requests must have launchd's audit context, never Terminal's.
 # The signed installed binaries implement request-trust; no new executable or
 # signing identity is created. Temporary jobs are removed on completion/Ctrl-C.
@@ -931,6 +982,189 @@ remediate_tcc_grant() {
   else
     warn '后台检查尚未通过，保留现有授权；以下状态检查会显示尚未完成的项目。'
   fi
+}
+
+reset_wechat_services() {
+# Reset all wechat LaunchAgents in one shot.
+#
+# 2026-05-18: 之前这里只处理 ai.wechat.bridge,但用户机上可能还存在
+# ai.wechat.orchestrate (或未来其它 LaunchAgent),KeepAlive=true 会在
+# 我们杀掉 wechatd 后立刻把它拉起来,带着 stale launchd responsibility
+# chain。即使 TCC 里 wechatd 的 cdhash 已经 Allowed,macOS 按 responsible
+# process 二次判定仍 false → AXIsProcessTrusted 永远 false,install.sh
+# 卡在等 Accessibility 的轮询里。
+#
+# 修复:发现 ~/Library/LaunchAgents/ai.wechat.*.plist 全部 bootout →
+# 杀干净所有进程 → 再 bootstrap 回来。新用户没 plist 是 no-op,老用户
+# 有几个就处理几个。无论起点如何,终态都是「干净 chain 的 LaunchAgent」。
+#
+# Why not `launchctl kickstart -k`: kickstart 只重执行进程,不重读 plist
+# 的 EnvironmentVariables,也不重置 launchd 缓存的 responsibility chain。
+# bootout + bootstrap 是唯一彻底重置的方式。
+LAUNCHAGENT_DIR=$(install_launchagent_dir)
+LAUNCHAGENT_PLIST="${LAUNCHAGENT_DIR}/ai.wechat.bridge.plist"  # 兼容下文 health 探测
+WECHAT_AGENT_PLISTS=()
+if [[ -d "${LAUNCHAGENT_DIR}" ]]; then
+  while IFS= read -r -d '' plist; do
+    WECHAT_AGENT_PLISTS+=("${plist}")
+  done < <(find "${LAUNCHAGENT_DIR}" -maxdepth 1 -name 'ai.wechat.*.plist' -print0 2>/dev/null)
+fi
+
+if (( ${#WECHAT_AGENT_PLISTS[@]} > 0 )); then
+  info "卸载 ${#WECHAT_AGENT_PLISTS[@]} 个 wechat LaunchAgent（彻底重置 launchd responsibility chain，否则 TCC 授权按旧 chain 算永远 false）"
+  for plist in "${WECHAT_AGENT_PLISTS[@]}"; do
+    agent="$(basename "${plist}" .plist)"
+    launchctl bootout "gui/$(id -u)/${agent}" 2>/dev/null || true
+  done
+else
+  info "未发现 wechat LaunchAgent (首次安装),直接装"
+fi
+
+# 杀掉所有 wechat-* 进程。bootout 已经卸掉 KeepAlive,所以这次杀完不会
+# 被自动拉起。包括之前手动起的、orchestrate 派生的、daemon 派生的全部。
+# 用 INSTALL_DIR 前缀过滤,避免误杀 WeChat.app 本身。
+for pat in \
+  "${INSTALL_DIR}/wechatd" \
+  "${INSTALL_DIR}/wechat-bridge" \
+  "${INSTALL_DIR}/wechat-wechaty-gateway" \
+  "${INSTALL_DIR}/wechat orchestrate" \
+  "${INSTALL_DIR}/wechat listen"; do
+  PIDS=$(pgrep -f "${pat}" 2>/dev/null || true)
+  if [[ -n "${PIDS}" ]]; then
+    info "停掉 ${pat##*/} (pid: ${PIDS})"
+    echo "${PIDS}" | xargs kill 2>/dev/null || true
+  fi
+done
+sleep 2
+# Give debugger-owning daemons time to detach cleanly. Never SIGKILL them
+# during migration: their attached WeChat process could be left suspended.
+for pat in \
+  "${INSTALL_DIR}/wechatd" \
+  "${INSTALL_DIR}/wechat-bridge" \
+  "${INSTALL_DIR}/wechat-wechaty-gateway" \
+  "${INSTALL_DIR}/wechat orchestrate" \
+  "${INSTALL_DIR}/wechat listen"; do
+  PIDS=$(pgrep -f "${pat}" 2>/dev/null || true)
+  if [[ -n "${PIDS}" ]]; then
+    for stopped_pid in $PIDS; do
+      for _ in {1..15}; do
+        kill -0 "$stopped_pid" 2>/dev/null || break
+        sleep 1
+      done
+      if kill -0 "$stopped_pid" 2>/dev/null; then
+        err "旧服务仍在退出（pid=${stopped_pid}），请稍后重试安装。"
+        exit 1
+      fi
+    done
+  fi
+done
+sleep 1
+
+# Bootstrap 回来。
+#
+# 顺序关键!!! ai.wechat.bridge 必须**先**起,因为 ai.wechat.orchestrate
+# RunAtLoad=true,bootstrap 后立刻派生 `wechat orchestrate run`,而该进程
+# 自己会 spawn wechatd 子进程。如果 orchestrate 抢在 bridge lazy-start
+# wechatd 之前,新 wechatd 的 launchd responsibility chain 就是
+# orchestrate → wechat CLI → install.sh 这条 stale path,AXIsProcessTrusted
+# 永远 false,install.sh 卡死在 wait Accessibility 循环。
+#
+# 修复:bridge 先 bootstrap + curl /health 强制 lazy-start wechatd(chain
+# 干净:wechatd 父 = bridge,bridge 父 = launchd),wechatd 站稳之后再
+# bootstrap 其它 plist。其它 LaunchAgent 起来时发现 wechatd socket
+# `/tmp/wechatd-${UID}.sock` 已被 bridge 派生的 wechatd 占用,二次 spawn
+# 必失败自杀 → 不污染 chain。
+#
+# 192.168.0.190 实测:不分顺序时 orchestrate 抢先 → wechatd chain 污染;
+# 分顺序后 bridge 抢先 → wechatd ax_trusted=true 一遍过。
+BRIDGE_PLIST_PATH="${LAUNCHAGENT_DIR}/ai.wechat.bridge.plist"
+
+# v1.16.19+: 首次安装 / plist 被清空场景兜底写一份。历史上 install.sh
+# 只 bootstrap 已存在的 plist,fresh 机器或 plist 被删干净的用户 install
+# 完根本没 LaunchAgent — bridge 永远不开机自启,agent / Hermes / Cloudflare
+# Tunnel 集成静默坏。daemon 通过 CLI lazy-spawn 自救,但 bridge 必须有
+# launchd entry 才能 login 自启 + crash 自恢复。
+mkdir -p "${LAUNCHAGENT_DIR}"
+if [[ ! -f "${BRIDGE_PLIST_PATH}" ]]; then
+  info "写 ai.wechat.bridge LaunchAgent plist (首次安装 / plist 被清空)"
+  cat > "${BRIDGE_PLIST_PATH}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.wechat.bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${INSTALL_DIR}/wechat-bridge</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+    <key>Crashed</key><true/>
+  </dict>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>StandardOutPath</key><string>/tmp/wechat-bridge.log</string>
+  <key>StandardErrorPath</key><string>/tmp/wechat-bridge.err</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUST_LOG</key><string>info</string>
+    <key>HOME</key><string>${HOME}</string>
+    <key>PATH</key><string>${INSTALL_DIR}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
+EOF
+  plutil -lint "${BRIDGE_PLIST_PATH}" >/dev/null 2>&1 || warn "  写出的 plist 语法异常,跑 \`plutil -lint ${BRIDGE_PLIST_PATH}\` 看详情"
+fi
+
+if [[ -f "${BRIDGE_PLIST_PATH}" ]]; then
+  info "先 bootstrap ai.wechat.bridge 抢 wechatd spawn 权 (避免其它 LaunchAgent 派生污染 chain)"
+  prepare_bridge_launchagent "$BRIDGE_PLIST_PATH" || return 1
+  bootstrap_bridge_launchagent "$BRIDGE_PLIST_PATH" || return 1
+  # Strong-trigger lazy-start: bridge 起来后 curl /health 让它 fork
+  # wechatd。给 2s 让 wechatd 真正落地接管 sock,之后其它 plist 派生
+  # 的 wechatd 才会发现 sock 被占而自杀。
+  curl -fsS -m 3 http://127.0.0.1:18400/health >/dev/null 2>&1 || true
+  sleep 2
+fi
+
+if (( ${#WECHAT_AGENT_PLISTS[@]} > 0 )); then
+  # 然后 bootstrap 剩下的(orchestrate 等)。如果只有 bridge 一个 plist,
+  # 这个循环啥也不做。
+  REMAINING=0
+  for plist in "${WECHAT_AGENT_PLISTS[@]}"; do
+    agent="$(basename "${plist}" .plist)"
+    [[ "${agent}" == "ai.wechat.bridge" ]] && continue
+    REMAINING=$((REMAINING + 1))
+    if ! launchctl bootstrap "gui/$(id -u)" "${plist}" 2>/dev/null; then
+      warn "  bootstrap ${agent} 失败 — 这个 LaunchAgent 可能已经损坏,跑 \`launchctl print gui/$(id -u)/${agent}\` 看详情"
+    fi
+  done
+  if (( REMAINING > 0 )); then
+    info "bootstrap 完剩余 ${REMAINING} 个 LaunchAgent (bridge 已先起,wechatd 由 bridge 派生)"
+  fi
+
+  # Bridge /health 复验 (上面 curl 已经试过一次,这里如果还没成是真问题)。
+  if [[ -f "${BRIDGE_PLIST_PATH}" ]]; then
+    if wait_for_bridge_health; then
+      RUNNING_PID=$(pgrep -f "${INSTALL_DIR}/wechat-bridge" 2>/dev/null | head -1)
+      success "LaunchAgent 已接管 + /health 200 OK (pid=${RUNNING_PID:-?})"
+    else
+      dump_bridge_diag "LaunchAgent 启动后 wechat-bridge /health 15s 内无 200 响应"
+      if ! bridge_log_says_tcc_missing; then
+        warn '后台服务尚未就绪，具体原因见上方诊断；保留当前微信登录。'
+      fi
+    fi
+  fi
+elif [[ ! -f "$BRIDGE_PLIST_PATH" ]] && launchctl list 2>/dev/null | grep -q ai.wechat.bridge; then
+  info "LaunchAgent 注册但 plist 不在标准路径，用 kickstart 重启"
+  launchctl kickstart -k "gui/$(id -u)/ai.wechat.bridge" 2>/dev/null || true
+  if ! wait_for_bridge_health; then
+    dump_bridge_diag "LaunchAgent kickstart 后 /health 仍无响应"
+  fi
+fi
 }
 
 if [[ "${WECHAT_USE_INSTALL_LIB_ONLY:-0}" == "1" ]]; then
@@ -1228,190 +1462,10 @@ for BIN in wechat wechatd wechat-bridge wechat-mcp wechat-wechaty-gateway; do
   fi
 done
 
-reset_wechat_services() {
-# Reset all wechat LaunchAgents in one shot.
-#
-# 2026-05-18: 之前这里只处理 ai.wechat.bridge,但用户机上可能还存在
-# ai.wechat.orchestrate (或未来其它 LaunchAgent),KeepAlive=true 会在
-# 我们杀掉 wechatd 后立刻把它拉起来,带着 stale launchd responsibility
-# chain。即使 TCC 里 wechatd 的 cdhash 已经 Allowed,macOS 按 responsible
-# process 二次判定仍 false → AXIsProcessTrusted 永远 false,install.sh
-# 卡在等 Accessibility 的轮询里。
-#
-# 修复:发现 ~/Library/LaunchAgents/ai.wechat.*.plist 全部 bootout →
-# 杀干净所有进程 → 再 bootstrap 回来。新用户没 plist 是 no-op,老用户
-# 有几个就处理几个。无论起点如何,终态都是「干净 chain 的 LaunchAgent」。
-#
-# Why not `launchctl kickstart -k`: kickstart 只重执行进程,不重读 plist
-# 的 EnvironmentVariables,也不重置 launchd 缓存的 responsibility chain。
-# bootout + bootstrap 是唯一彻底重置的方式。
-LAUNCHAGENT_DIR=$(install_launchagent_dir)
-LAUNCHAGENT_PLIST="${LAUNCHAGENT_DIR}/ai.wechat.bridge.plist"  # 兼容下文 health 探测
-WECHAT_AGENT_PLISTS=()
-if [[ -d "${LAUNCHAGENT_DIR}" ]]; then
-  while IFS= read -r -d '' plist; do
-    WECHAT_AGENT_PLISTS+=("${plist}")
-  done < <(find "${LAUNCHAGENT_DIR}" -maxdepth 1 -name 'ai.wechat.*.plist' -print0 2>/dev/null)
-fi
 
-if (( ${#WECHAT_AGENT_PLISTS[@]} > 0 )); then
-  info "卸载 ${#WECHAT_AGENT_PLISTS[@]} 个 wechat LaunchAgent（彻底重置 launchd responsibility chain，否则 TCC 授权按旧 chain 算永远 false）"
-  for plist in "${WECHAT_AGENT_PLISTS[@]}"; do
-    agent="$(basename "${plist}" .plist)"
-    launchctl bootout "gui/$(id -u)/${agent}" 2>/dev/null || true
-  done
-else
-  info "未发现 wechat LaunchAgent (首次安装),直接装"
-fi
-
-# 杀掉所有 wechat-* 进程。bootout 已经卸掉 KeepAlive,所以这次杀完不会
-# 被自动拉起。包括之前手动起的、orchestrate 派生的、daemon 派生的全部。
-# 用 INSTALL_DIR 前缀过滤,避免误杀 WeChat.app 本身。
-for pat in \
-  "${INSTALL_DIR}/wechatd" \
-  "${INSTALL_DIR}/wechat-bridge" \
-  "${INSTALL_DIR}/wechat-wechaty-gateway" \
-  "${INSTALL_DIR}/wechat orchestrate" \
-  "${INSTALL_DIR}/wechat listen"; do
-  PIDS=$(pgrep -f "${pat}" 2>/dev/null || true)
-  if [[ -n "${PIDS}" ]]; then
-    info "停掉 ${pat##*/} (pid: ${PIDS})"
-    echo "${PIDS}" | xargs kill 2>/dev/null || true
-  fi
-done
-sleep 2
-# Give debugger-owning daemons time to detach cleanly. Never SIGKILL them
-# during migration: their attached WeChat process could be left suspended.
-for pat in \
-  "${INSTALL_DIR}/wechatd" \
-  "${INSTALL_DIR}/wechat-bridge" \
-  "${INSTALL_DIR}/wechat-wechaty-gateway" \
-  "${INSTALL_DIR}/wechat orchestrate" \
-  "${INSTALL_DIR}/wechat listen"; do
-  PIDS=$(pgrep -f "${pat}" 2>/dev/null || true)
-  if [[ -n "${PIDS}" ]]; then
-    for stopped_pid in $PIDS; do
-      for _ in {1..15}; do
-        kill -0 "$stopped_pid" 2>/dev/null || break
-        sleep 1
-      done
-      if kill -0 "$stopped_pid" 2>/dev/null; then
-        err "旧服务仍在退出（pid=${stopped_pid}），请稍后重试安装。"
-        exit 1
-      fi
-    done
-  fi
-done
-sleep 1
-
-# Bootstrap 回来。
-#
-# 顺序关键!!! ai.wechat.bridge 必须**先**起,因为 ai.wechat.orchestrate
-# RunAtLoad=true,bootstrap 后立刻派生 `wechat orchestrate run`,而该进程
-# 自己会 spawn wechatd 子进程。如果 orchestrate 抢在 bridge lazy-start
-# wechatd 之前,新 wechatd 的 launchd responsibility chain 就是
-# orchestrate → wechat CLI → install.sh 这条 stale path,AXIsProcessTrusted
-# 永远 false,install.sh 卡死在 wait Accessibility 循环。
-#
-# 修复:bridge 先 bootstrap + curl /health 强制 lazy-start wechatd(chain
-# 干净:wechatd 父 = bridge,bridge 父 = launchd),wechatd 站稳之后再
-# bootstrap 其它 plist。其它 LaunchAgent 起来时发现 wechatd socket
-# `/tmp/wechatd-${UID}.sock` 已被 bridge 派生的 wechatd 占用,二次 spawn
-# 必失败自杀 → 不污染 chain。
-#
-# 192.168.0.190 实测:不分顺序时 orchestrate 抢先 → wechatd chain 污染;
-# 分顺序后 bridge 抢先 → wechatd ax_trusted=true 一遍过。
-BRIDGE_PLIST_PATH="${LAUNCHAGENT_DIR}/ai.wechat.bridge.plist"
-
-# v1.16.19+: 首次安装 / plist 被清空场景兜底写一份。历史上 install.sh
-# 只 bootstrap 已存在的 plist,fresh 机器或 plist 被删干净的用户 install
-# 完根本没 LaunchAgent — bridge 永远不开机自启,agent / Hermes / Cloudflare
-# Tunnel 集成静默坏。daemon 通过 CLI lazy-spawn 自救,但 bridge 必须有
-# launchd entry 才能 login 自启 + crash 自恢复。
-mkdir -p "${LAUNCHAGENT_DIR}"
-if [[ ! -f "${BRIDGE_PLIST_PATH}" ]]; then
-  info "写 ai.wechat.bridge LaunchAgent plist (首次安装 / plist 被清空)"
-  cat > "${BRIDGE_PLIST_PATH}" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>ai.wechat.bridge</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${INSTALL_DIR}/wechat-bridge</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key>
-  <dict>
-    <key>SuccessfulExit</key><false/>
-    <key>Crashed</key><true/>
-  </dict>
-  <key>ThrottleInterval</key><integer>60</integer>
-  <key>StandardOutPath</key><string>/tmp/wechat-bridge.log</string>
-  <key>StandardErrorPath</key><string>/tmp/wechat-bridge.err</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>RUST_LOG</key><string>info</string>
-    <key>HOME</key><string>${HOME}</string>
-    <key>PATH</key><string>${INSTALL_DIR}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-  </dict>
-</dict>
-</plist>
-EOF
-  plutil -lint "${BRIDGE_PLIST_PATH}" >/dev/null 2>&1 || warn "  写出的 plist 语法异常,跑 \`plutil -lint ${BRIDGE_PLIST_PATH}\` 看详情"
-fi
-
-if [[ -f "${BRIDGE_PLIST_PATH}" ]]; then
-  info "先 bootstrap ai.wechat.bridge 抢 wechatd spawn 权 (避免其它 LaunchAgent 派生污染 chain)"
-  prepare_bridge_launchagent "$BRIDGE_PLIST_PATH" || return 1
-  bootstrap_bridge_launchagent "$BRIDGE_PLIST_PATH" || return 1
-  # Strong-trigger lazy-start: bridge 起来后 curl /health 让它 fork
-  # wechatd。给 2s 让 wechatd 真正落地接管 sock,之后其它 plist 派生
-  # 的 wechatd 才会发现 sock 被占而自杀。
-  curl -fsS -m 3 http://127.0.0.1:18400/health >/dev/null 2>&1 || true
-  sleep 2
-fi
-
-if (( ${#WECHAT_AGENT_PLISTS[@]} > 0 )); then
-  # 然后 bootstrap 剩下的(orchestrate 等)。如果只有 bridge 一个 plist,
-  # 这个循环啥也不做。
-  REMAINING=0
-  for plist in "${WECHAT_AGENT_PLISTS[@]}"; do
-    agent="$(basename "${plist}" .plist)"
-    [[ "${agent}" == "ai.wechat.bridge" ]] && continue
-    REMAINING=$((REMAINING + 1))
-    if ! launchctl bootstrap "gui/$(id -u)" "${plist}" 2>/dev/null; then
-      warn "  bootstrap ${agent} 失败 — 这个 LaunchAgent 可能已经损坏,跑 \`launchctl print gui/$(id -u)/${agent}\` 看详情"
-    fi
-  done
-  if (( REMAINING > 0 )); then
-    info "bootstrap 完剩余 ${REMAINING} 个 LaunchAgent (bridge 已先起,wechatd 由 bridge 派生)"
-  fi
-
-  # Bridge /health 复验 (上面 curl 已经试过一次,这里如果还没成是真问题)。
-  if [[ -f "${BRIDGE_PLIST_PATH}" ]]; then
-    if wait_for_bridge_health; then
-      RUNNING_PID=$(pgrep -f "${INSTALL_DIR}/wechat-bridge" 2>/dev/null | head -1)
-      success "LaunchAgent 已接管 + /health 200 OK (pid=${RUNNING_PID:-?})"
-    else
-      dump_bridge_diag "LaunchAgent 启动后 wechat-bridge /health 15s 内无 200 响应"
-      if ! bridge_log_says_tcc_missing; then
-        warn '后台服务尚未就绪，具体原因见上方诊断；保留当前微信登录。'
-      fi
-    fi
-  fi
-elif [[ ! -f "$BRIDGE_PLIST_PATH" ]] && launchctl list 2>/dev/null | grep -q ai.wechat.bridge; then
-  info "LaunchAgent 注册但 plist 不在标准路径，用 kickstart 重启"
-  launchctl kickstart -k "gui/$(id -u)/ai.wechat.bridge" 2>/dev/null || true
-  if ! wait_for_bridge_health; then
-    dump_bridge_diag "LaunchAgent kickstart 后 /health 仍无响应"
-  fi
-fi
-}
-
+install_setup_window || { err '设置组件安装失败，原有登录和数据保留。'; exit 1; }
 step '4/4 检查后台服务与剩余设置'
+if [[ "${SETUP_WINDOW_AVAILABLE:-0}" != 1 ]]; then
 run_service_phase
 
 
@@ -1452,6 +1506,8 @@ else
   warn '后台服务未就绪，日志未显示明确的辅助功能授权错误。请运行 wechat-use doctor 排查，不要反复重置授权。'
   echo ""
 fi
+
+fi # legacy release without the unified setup component
 
 # Print installed CLI version + the supported WeChat matrix so the user
 # immediately knows what they got and what their WeChat needs to look like.
@@ -1603,6 +1659,14 @@ esac
 
 # One current snapshot; print only incomplete steps, never ask configured users
 # to reactivate/reinitialize merely because they ran the installer again.
+if [[ "${SETUP_WINDOW_AVAILABLE:-0}" == 1 ]]; then
+  if [[ "${WECHAT_SETUP_DEFER:-0}" != 1 ]]; then
+    "$INSTALL_DIR/wechat" setup || { warn '设置尚未完成，稍后打开“微信工具设置”即可继续，已有数据保留。'; exit 1; }
+  fi
+  success '安装完成；后续可从“微信工具设置”继续检查或恢复。'
+  if [[ "${WECHAT_USE_INSTALL_SKILL:-no}" == yes ]]; then offer_agent_skill_install; fi
+  exit 0
+fi
 FINAL_DOCTOR_REPORT=$("$INSTALL_DIR/wechat" doctor --json 2>/dev/null || true)
 FINAL_SUBSCRIPTION_STATE=$(installer_subscription_state)
 FINAL_BRIDGE_OK=0

@@ -3,7 +3,7 @@ name: wechat-use
 description: "macOS WeChat CLI + local HTTP bridge + Wechaty Puppet gRPC gateway — send messages, query sessions / contacts / chat history / images / favorites, and expose stable HTTP / gRPC surfaces for agent integration. Use when the user asks to 'send a WeChat message', '发微信', query WeChat contacts/groups/messages, look up who said what in a chat, fetch images from history, export chat history, wire WeChat into Hermes / n8n / Dify / LangChain, or run any wechaty bot on a real macOS WeChat account. Uses the installer-managed, isolated WeChat 4.1.9 clone on macOS (Apple Silicon) and a `wechatuse_` activation code. One-time `wechat-use init` extracts the DB key; no sudo, no re-signing WeChat.app. Optional remote bridge — `wechat-use tunnel setup --hostname YOUR_HOSTNAME` exposes the local REST API via Cloudflare Tunnel for remote services to call."
 metadata:
   author: leeguooooo
-  version: "1.18.5"
+  version: "1.18.6"
   platform: macOS-arm64
   requires:
     - macOS >= 14 (Apple Silicon)
@@ -23,13 +23,17 @@ The installer automatically copies a supported local 4.1.9 or downloads a pinned
 
 All CLI, daemon, HTTP bridge, and MCP operations default to that clone. Check its current state first and reuse an existing login. If it is closed, launch it with `open -g "$HOME/Applications/WeChat-4.1.9-wechat-use.app"`. Request first-time login only when it is actually required, then run `wechat-use init`. Do not substitute `open -a WeChat`, sign the primary `/Applications/WeChat.app`, remove the managed selection, or fall back to the primary when the clone is closed. Only 4.1.9 receives ongoing compatibility work. When repairing installation, rerun the installer; do not download the latest WeChat.
 
-## First-install permission onboarding (v1.18.5+)
+## Unified setup and recovery (v1.18.6+)
 
-After the user logs into the dedicated clone, run `wechat-use init`. An interactive terminal checks the running daemon's Accessibility permission and guides missing authorization automatically. It opens the correct settings pane and selects wechatd / wechat-bridge in Finder for drag-and-drop; the user grants permission, then init rechecks and continues. It preserves login and initialized keys.
+Use `wechat-use setup --json` to inspect the current setup stage without opening UI. For a normal user, the curl installer and interactive `wechat-use init` use the same native setup window. It preserves existing activation, login and keys, selects compatible installed developer tools for the tool only, starts the official background service, and verifies actual service ownership and permissions.
 
-Agents and scripts should first use `wechat-use init --json` (no window changes). If `status=needs_permissions`, run `wechat-use init --fix-tcc` for this necessary one-time system authorization. Explain that the user only needs to drag the selected files into Accessibility if absent and enable their switches. Do not ask them to locate hidden paths, restart WeChat, or manually open a chat. `permission_check_unavailable` means the daemon check failed; inspect doctor instead of resetting permissions.
+If a user action is needed, run `wechat-use setup` or open `~/Applications/WechatUseSetup.app`. Let the window handle activation, login, system authorization, drag-and-drop and rechecking. Do not give users sequences of `doctor`, `init`, `launchctl`, or `xcode-select` repair commands. Never launch a Terminal-owned daemon as a permission workaround. The service must be owned by the official bridge.
 
-`--skip-smoke` skips sending, not the permission check. `send_permission_ready=true` confirms permission only, not delivery. Already granted permission never opens settings, even with `--fix-tcc`.
+The bridge's `/setup/status` remains available before keys or Accessibility grants are ready. It is diagnostic only; sending remains gated. Setup control uses local signals to the validated launchd process, not an unauthenticated HTTP write endpoint.
+
+An unconfirmed setup test is persisted and is not automatically replayed after closing or reopening the window. `--skip-verify` explicitly skips sending; permission readiness alone is not delivery evidence. Human identity confirmation and actual macOS grants remain user-controlled.
+
+[User setup guide](docs/setup.html)
 
 ## Background execution
 
