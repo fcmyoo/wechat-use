@@ -33,6 +33,8 @@ Agents and scripts should first use `wechat-use init --json` (no window changes)
 
 ## Background execution
 
+When System Settings shows the tool enabled but the actual launchd bridge still rejects Accessibility, do not treat the displayed switch as proof. Check the installed path and signature, refresh only that tool's switch, and recheck a freshly loaded official service. If those checks still fail, the specific old permission entry may be stale. An authorized local computer-control agent can remove and re-add only the failing tool entry using the current installed binary. Identify the exact row before each action; do not use blind coordinates or reset other apps' permissions. Preserve the dedicated WeChat process and keys. Afterwards verify HTTP health, the daemon's real Accessibility result, and that its parent is the official bridge. A user identity challenge remains a user action.
+
 Normal operations must preserve the user's foreground window. Do not call
 `open -a`, activate/raise/unminimize the clone, switch applications, or use
 foreground/global hotkeys as routine preparation. Use process-targeted input

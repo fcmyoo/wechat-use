@@ -897,7 +897,7 @@ remediate_tcc_grant() {
   info '无需授权终端、输入命令或重新登录；完成后安装器会自动继续。'
   if ! request_background_permission wechat-bridge; then
     exec 3>&-
-    warn '系统尚未确认当前后台程序的授权。旧条目开启不一定对应当前程序；请核对已选中的工具，勿全局重置权限。'
+    warn '系统仍未允许当前后台程序。若 wechat-bridge 开关已经开启且刷新无效，只重建这一条工具授权，再添加已选中的当前程序；其他应用权限保持原样。'
     return 0
   fi
   # Retire the Terminal-spawned daemon left by earlier init/chat attempts.
@@ -1111,7 +1111,7 @@ for BIN_NAME in "${BINS[@]}"; do
     # Monitoring grant. The whole point of Developer ID is that macOS keys the
     # TCC grant off the stable identity (team + identifier), so it survives
     # upgrades. Leave it exactly as shipped — do NOT touch it.
-    info "${BIN_NAME} 已 Developer ID 签名（已公证），保留原签名 —— TCC 跨升级不用重勾"
+    info "${BIN_NAME} 已 Developer ID 签名（已公证），保留原签名；后台会核验现有授权"
   elif [[ "${EXISTING_IDENT}" == "${IDENTIFIER}" ]]; then
     # Already ad-hoc signed by us with the same identifier — leave alone, TCC
     # is presumably still in effect. (Legacy path for pre-Developer-ID releases.)
