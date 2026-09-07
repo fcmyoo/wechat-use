@@ -51,19 +51,13 @@
 curl -fsSL https://raw.githubusercontent.com/leeguooooo/wechat-use/main/install.sh | bash
 ```
 
-安装器**自动**准备并安装独立微信 4.1.9 副本（本地已有支持版本就复用，否则从腾讯官方固定地址下载并校验 SHA-256），并把工具绑定到它——**不再询问**。装完打开 `~/Applications/WeChat-4.1.9-wechat-use.app` 扫码登录。确认 `~/.local/bin` 在 `PATH` 里（zsh：`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc`）。
+安装器自动准备并绑定独立微信 4.1.9 副本，本地已有支持版本就复用，否则从腾讯官方下载并校验。主微信保持原样。
 
-**3. 按顺序跑**（install.sh 输出末尾也会重述）
+**3. 在“微信工具设置”中完成剩余步骤（v1.18.6 起）**
 
-```bash
-wechat-use auth activate wechatuse_xxxxxx   # 1) 输入激活码（务必先做）
-wechat-use doctor                            # 2) 体检，出问题先跑这个
-wechat-use init                              # 3) 抽数据库 key（自动按版本适配）
-wechat-use send "Hello 🎉" filehelper        # 4) 后台发送测试，无需手动选聊天或预热
-```
+窗口会复用已有激活、登录和有效权限，只显示还缺的步骤。首次使用时，在窗口粘贴激活码，按提示完成微信登录和 macOS 授权；系统列表缺项时，把窗口中的工具图标拖入即可。后台初始化和连接验证自动继续。
 
-> 首次发送需给 wechatd / wechat-bridge「辅助功能」权限：安装器会提示，交互设置跑 `wechat-use doctor --fix-tcc`（详情 [docs/install.md#tcc](./docs/install.md)）。
-> ❗ 顺序别反：`init` 不需激活码也能跑，但 send / sessions 等查询命令都要激活，反了会在发送时才发现没激活。
+后续恢复也打开“应用程序”中的“微信工具设置”，无需输入诊断或修复命令。旧授权开关已开却不生效时，窗口先刷新后台检查，再提供对应工具的恢复说明。详见[设置指南](./docs/setup.html)。v1.18.5 及更早版本的终端流程见[旧版安装说明](./docs/install.md)。
 
 ---
 
