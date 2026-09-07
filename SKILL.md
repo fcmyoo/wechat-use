@@ -19,7 +19,7 @@ Unified CLI for WeChat on macOS. Send messages and query the encrypted local dat
 
 ## Managed WeChat 4.1.9 (v1.18.0+)
 
-The installer asks for confirmation, then copies a supported local 4.1.9 or downloads a pinned Tencent DMG. It installs `~/Applications/WeChat-4.1.9-wechat-use.app` with its own bundle ID and sandbox container, disables that clone's updates, and saves `~/.wx-rs/managed-wechat.json`.
+The installer automatically copies a supported local 4.1.9 or downloads a pinned Tencent DMG (no prompt). It installs `~/Applications/WeChat-4.1.9-wechat-use.app` with its own bundle ID and sandbox container, disables that clone's updates, and saves `~/.wx-rs/managed-wechat.json`.
 
 All CLI, daemon, HTTP bridge, and MCP operations default to that clone. Check its current state first and reuse an existing login. If it is closed, launch it with `open -g "$HOME/Applications/WeChat-4.1.9-wechat-use.app"`. Request first-time login only when it is actually required, then run `wechat-use init`. Do not substitute `open -a WeChat`, sign the primary `/Applications/WeChat.app`, remove the managed selection, or fall back to the primary when the clone is closed. Only 4.1.9 receives ongoing compatibility work. When repairing installation, rerun the installer; do not download the latest WeChat.
 
