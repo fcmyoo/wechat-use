@@ -3,7 +3,7 @@ name: wechat-use
 description: "macOS WeChat CLI + local HTTP bridge + Wechaty Puppet gRPC gateway — send messages, query sessions / contacts / chat history / images / favorites, and expose stable HTTP / gRPC surfaces for agent integration. Use when the user asks to 'send a WeChat message', '发微信', query WeChat contacts/groups/messages, look up who said what in a chat, fetch images from history, export chat history, wire WeChat into Hermes / n8n / Dify / LangChain, or run any wechaty bot on a real macOS WeChat account. Uses the installer-managed, isolated WeChat 4.1.9 clone on macOS (Apple Silicon) and a `wechatuse_` activation code. One-time `wechat-use init` extracts the DB key; no sudo, no re-signing WeChat.app. Optional remote bridge — `wechat-use tunnel setup --hostname YOUR_HOSTNAME` exposes the local REST API via Cloudflare Tunnel for remote services to call."
 metadata:
   author: leeguooooo
-  version: "1.18.3"
+  version: "1.18.4"
   platform: macOS-arm64
   requires:
     - macOS >= 14 (Apple Silicon)
@@ -111,13 +111,16 @@ Endpoints:
 | POST | `/typing` | typing indicator (only when `--shape hermes`) |
 | GET  | `/messages/stream?since=<epoch>` | new_messages_since polled into SSE; **pass `since`** or you'll get the full backlog on first connect |
 
-### Image-send prerequisites
+### Account readiness and image sends
 
-A newly initialized account currently needs at least three existing outgoing
-messages in File Transfer Assistant for sender calibration. If image sending
-returns `self_sender_uncalibrated`, no image was submitted. Do not manufacture
-messages to satisfy this requirement without the user's authorization.
-New-chat first-event delivery in CLI `listen` is still under validation.
+Image sending and self-message reads resolve the current account in each message
+shard; File Transfer Assistant warmup samples are no longer required on the
+managed 4.1.9 path. `/health` reports `wechat.state` and `wechat.account_state`
+separately from daemon liveness. `not_ready` means the account is not ready for
+sending; `needs_wechat_login` in doctor requires completing WeChat login, not
+reinitializing or deleting caches. WeChat may still require phone confirmation
+or a QR login. The tool never bypasses that confirmation.
+
 Ordinary files, videos and cards are not supported by native send yet.
 
 ### Images over HTTP
