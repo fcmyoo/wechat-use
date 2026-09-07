@@ -350,26 +350,18 @@ find_preferred_wechat_source() {
 }
 
 choose_preferred_wechat_419() {
-  local choice="${WECHAT_USE_PREFER_419:-ask}"
-  if [[ "$choice" == ask ]] && previous_clone_choice_is_valid; then
+  # wechat-use 必须使用微信 4.1.9 独立副本，直接安装，不再询问。
+  local choice="${WECHAT_USE_PREFER_419:-yes}"
+  # 兼容旧的 ask 取值：一律视为同意安装。
+  [[ "$choice" == ask ]] && choice=yes
+  if [[ "$choice" == yes ]] && previous_clone_choice_is_valid; then
     info "复用已确认的独立副本：$PREFERRED_WECHAT_NAME"
     return 0
   fi
   printf '\n微信 4.1.9 独立副本\n'
-  printf '  wechat-use 专注兼容微信 4.1.9，功能支持最全、使用体验最好。\n'
-  printf '  同意后自动安装独立副本，工具默认使用它；主微信程序和聊天数据保持原样。\n'
+  printf '  wechat-use 专注兼容微信 4.1.9，功能支持最全、使用体验最好，将自动安装独立副本。\n'
+  printf '  工具默认使用该副本；主微信程序和聊天数据保持原样。\n'
   printf '  副本需要单独登录，自动更新会关闭，以保持 4.1.9。\n\n'
-  if [[ "$choice" == ask ]]; then
-    if open_install_tty; then
-      printf '[install] 安装并使用微信 4.1.9 独立副本？[Y/n] ' >&3
-      IFS= read -r choice <&3 || choice=skip
-      exec 3>&-
-      [[ -n "$choice" ]] || choice=yes
-    else
-      err '非交互安装请设置 WECHAT_USE_PREFER_419=yes；未获得选择，安装未开始。'
-      return 2
-    fi
-  fi
   case "$choice" in
     y|Y|yes|YES|Yes|1|true|TRUE|是|要) return 0 ;;
     n|N|no|NO|No|0|false|FALSE|否|不要|skip)
