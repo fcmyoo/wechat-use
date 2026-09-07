@@ -24,6 +24,7 @@ GOOD_HEALTH='{"bridge_version":"1.18.2","daemon":{"version":"1.18.2","alive":tru
 reset_fixture() {
   BINARIES_CHANGED=0 CLONE_SELECTION_UNCHANGED=1 MOCK_REGISTERED=1 MOCK_NETWORK=1 MOCK_PARENT=42
   MOCK_PROGRAM="$INSTALL_DIR/wechat-bridge"
+  MOCK_SERVICE_PATH="$INSTALL_DIR:/usr/bin:/bin:/usr/sbin:/sbin"
   MOCK_DAEMON_PATH="$INSTALL_DIR/wechatd"
   HEALTH="$GOOD_HEALTH"
   printf '%s' "$GOOD_REPORT" > "$TEST_ROOT/doctor.json"
@@ -32,7 +33,7 @@ reset_fixture() {
 }
 launchctl() {
   [[ "$1" == print && "$MOCK_REGISTERED" == 1 ]] || return 1
-  printf '\tprogram = %s\n\tpid = 42\n' "$MOCK_PROGRAM"
+  printf '\tprogram = %s\n\tpid = 42\n\tenvironment = {\n\t\tPATH => %s\n\t}\n' "$MOCK_PROGRAM" "$MOCK_SERVICE_PATH"
 }
 curl() { [[ "$MOCK_NETWORK" == 1 ]] && printf '%s' "$HEALTH"; }
 ps() {
@@ -49,9 +50,10 @@ run_service_phase >/dev/null
 [[ "$SERVICES_REUSED" == 1 && ! -s "$TEST_ROOT/actions" ]]
 maybe_smoke_send >/dev/null
 [[ ! -s "$TEST_ROOT/actions" ]]
-for failure in bytes selection registration program network old_bridge old_daemon missing dead path parent ax malformed; do
+for failure in service_path bytes selection registration program network old_bridge old_daemon missing dead path parent ax malformed; do
   reset_fixture
   case "$failure" in
+    service_path) MOCK_SERVICE_PATH=/usr/bin:/bin ;;
     bytes) BINARIES_CHANGED=1 ;;
     selection) CLONE_SELECTION_UNCHANGED=0 ;;
     registration) MOCK_REGISTERED=0 ;;
@@ -144,6 +146,8 @@ echo 'PASS: byte comparison and optional skill opt-in; no headless tty access or
   curl() { return 0; }
   reset_wechat_services > "$TEST_ROOT/fresh-output"
   [[ -f "$TEST_ROOT/agents/ai.wechat.bridge.plist" ]]
+  service_path=$(plutil -extract EnvironmentVariables.PATH raw -o - "$TEST_ROOT/agents/ai.wechat.bridge.plist")
+  [[ ":$service_path:" == *":/usr/sbin:"* && ":$service_path:" == *":/sbin:"* ]]
   [[ "$(grep -c '^bootstrap ' "$TEST_ROOT/fresh-actions")" == 1 ]]
   if grep -E 'kickstart|bootout' "$TEST_ROOT/fresh-actions"; then exit 1; fi
 )

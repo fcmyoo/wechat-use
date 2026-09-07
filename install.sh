@@ -577,6 +577,9 @@ can_reuse_running_services() {
   [[ -f "$plist" ]] || return 1
   [[ "$(plutil -extract ProgramArguments.0 raw -o - "$plist" 2>/dev/null)" == "$INSTALL_DIR/wechat-bridge" ]] || return 1
   registered=$(launchctl print "gui/$(id -u)/ai.wechat.bridge" 2>/dev/null) || return 1
+  local runtime_path
+  runtime_path=$(printf '%s\n' "$registered" | awk '/^[[:space:]]*environment = \{/ {inside=1;next} inside && /^[[:space:]]*\}/ {inside=0} inside && /^[[:space:]]*PATH => / {sub(/^[[:space:]]*PATH => /, "");print;exit}')
+  [[ ":$runtime_path:" == *":/usr/sbin:"* && ":$runtime_path:" == *":/sbin:"* ]] || return 1
   [[ "$(printf '%s\n' "$registered" | awk -F ' = ' '/^[[:space:]]*program = / {print $2; exit}')" == "$INSTALL_DIR/wechat-bridge" ]] || return 1
   bridge_pid=$(printf '%s\n' "$registered" | awk '/^[[:space:]]*pid = / {print $3; exit}')
   [[ "$bridge_pid" =~ ^[1-9][0-9]*$ ]] || return 1
@@ -1157,7 +1160,7 @@ if [[ ! -f "${BRIDGE_PLIST_PATH}" ]]; then
   <dict>
     <key>RUST_LOG</key><string>info</string>
     <key>HOME</key><string>${HOME}</string>
-    <key>PATH</key><string>${INSTALL_DIR}:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PATH</key><string>${INSTALL_DIR}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
 </dict>
 </plist>
