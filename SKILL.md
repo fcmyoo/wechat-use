@@ -3,7 +3,7 @@ name: wechat-use
 description: "macOS WeChat CLI + local HTTP bridge + Wechaty Puppet gRPC gateway — send messages, query sessions / contacts / chat history / images / favorites, and expose stable HTTP / gRPC surfaces for agent integration. Use when the user asks to 'send a WeChat message', '发微信', query WeChat contacts/groups/messages, look up who said what in a chat, fetch images from history, export chat history, wire WeChat into Hermes / n8n / Dify / LangChain, or run any wechaty bot on a real macOS WeChat account. Uses the installer-managed, isolated WeChat 4.1.9 clone on macOS (Apple Silicon) and a `wechatuse_` activation code. One-time `wechat-use init` extracts the DB key; no sudo, no re-signing WeChat.app. Optional remote bridge — `wechat-use tunnel setup --hostname YOUR_HOSTNAME` exposes the local REST API via Cloudflare Tunnel for remote services to call."
 metadata:
   author: leeguooooo
-  version: "1.18.6"
+  version: "1.18.7"
   platform: macOS-arm64
   requires:
     - macOS >= 14 (Apple Silicon)
@@ -14,6 +14,12 @@ metadata:
 ---
 
 # wechat — macOS CLI
+
+## Setup failures and user reports (v1.18.7+)
+
+Do not require users to identify their macOS version or whether this is a fresh install before helping. The setup window collects redacted environment and service facts automatically. Read the `WXS-…` problem code from an error screenshot; if more detail is needed, the user can click “复制诊断信息” on any setup page, including a waiting page. The window also provides a minimal report when core cannot start. Never request keys.json, activation tokens, raw memory output, or private chat data.
+
+Missing system developer-tool authorization is detected before initialization and uses “授权并继续” with the native macOS administrator confirmation. Preserve existing login and grants. Do not suggest reinstalling or globally resetting permissions for an unexplained initialization failure. A v1.18.6 error window can use its existing “修复安装” button to upgrade once to the current release; then follow the specific diagnosis rather than repeatedly reinstalling.
 
 Unified CLI for WeChat on macOS. Send messages and query the encrypted local databases for sessions, contacts, chat history, group members, Moments, favorites. Conversation selection runs inside the managed clone without activating or raising its windows.
 
